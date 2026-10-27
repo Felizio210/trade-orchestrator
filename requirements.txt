@@ -1,0 +1,12 @@
+requests>=2.31
+numpy>=1.26
+pandas>=2.1
+pyarrow>=15
+python-dotenv>=1.0
+# GCP version only (the local version never imports these)
+google-cloud-storage>=2.14
+google-cloud-pubsub>=2.21
+google-cloud-bigquery>=3.17
+db-dtypes>=1.2
+# dev
+pytest>=8

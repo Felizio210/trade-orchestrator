@@ -1,0 +1,14 @@
+.env
+*.json
+!package.json
+__pycache__/
+.venv/
+data/
+.pytest_cache/
+.local_gcp/
+.venv-airflow/
+.airflow/
+*.log
+*.sqlite
+*.db
+.DS_Store
