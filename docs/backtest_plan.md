@@ -33,7 +33,7 @@ backtest.metrics                output
 |---|---|---|
 | `runs` | run_id, strategy, params_json, symbols, timeframe, start_date, end_date, initial_capital, risk_per_trade, spread_json, commission_rate, git_sha, data_cutoff (max ingested_at read), status, error, created_at, finished_at | -, `strategy` |
 | `trades` | run_id, symbol, side, qty, entry_ts, entry_price, exit_ts, exit_price, exit_reason, stop, target, commission, pnl, r_multiple, date (= entry date) | `date`, `run_id, symbol` |
-| `equity` | run_id, symbol, ts, date, position, equity, drawdown | `date`, `run_id, symbol` |
+| `equity` | run_id, symbol, ts, date, position, equity, drawdown, side, lots, note (readable labels: LONG/SHORT, size in lots, entry / open / closed / flat) | `date`, `run_id, symbol` |
 | `metrics` | run_id, symbol (`ALL` for portfolio), n_trades, total_return, cagr, sharpe, sortino, max_drawdown, win_rate, profit_factor, exposure | -, `run_id` |
 
 Writes use `cloud.bq.replace_from_dataframe(df, table, match={"run_id": run_id})`

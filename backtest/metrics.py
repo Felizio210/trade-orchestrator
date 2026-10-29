@@ -10,6 +10,23 @@ def drawdown(equity: pd.Series) -> pd.Series:
     return equity / equity.cummax() - 1
 
 
+def bar_labels(equity: pd.DataFrame, trades: pd.DataFrame, contract_size: float) -> pd.DataFrame:
+    """Readable columns for each equity row: side (LONG | SHORT | -), lots, and a note
+    saying what happened on that bar. A trade that opens and closes inside one bar never
+    shows a position, so its close is the only place it appears."""
+    pos = equity["position"]
+    side = np.select([pos > 0, pos < 0], ["LONG", "SHORT"], "-")
+    note = pd.Series(np.where(pos == 0, "flat", np.where(pos.shift(fill_value=0) == 0, "entry", "open")),
+                     index=equity.index)
+    closes = {
+        t.exit_ts: f"{'entry+' if t.entry_ts == t.exit_ts else ''}closed: {t.exit_reason} ({t.pnl:+.2f})"
+        for t in trades.itertuples()
+    }
+    note = equity["ts"].map(closes).fillna(note)
+    return pd.DataFrame({"side": side, "lots": (pos.abs() / contract_size).round(2), "note": note},
+                        index=equity.index)
+
+
 def compute(trades: pd.DataFrame, equity: pd.DataFrame, initial_capital: float) -> dict:
     """equity: ts, equity, position (one row per bar). Ratios are annualized with the
     number of bars per year actually seen in the data, so they work for any timeframe."""

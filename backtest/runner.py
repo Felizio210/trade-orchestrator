@@ -20,7 +20,7 @@ from backtest import strategies
 from backtest.config import BacktestSettings
 from backtest.data import load_bars
 from backtest.engine import Costs, simulate
-from backtest.metrics import combine_equity, compute, drawdown
+from backtest.metrics import bar_labels, combine_equity, compute, drawdown
 from backtest.tables import TABLES, table_id
 from cloud import Cloud
 from ingestion.dukascopy.config import Settings
@@ -105,6 +105,7 @@ def run(
             equity["symbol"] = symbol
             equity["date"] = pd.to_datetime(equity["ts"], utc=True).dt.date
             equity["drawdown"] = drawdown(equity["equity"])
+            equity[["side", "lots", "note"]] = bar_labels(equity, trades, settings.contract_size_for(symbol))
             all_trades.append(trades)
             all_equity.append(equity)
             curves[symbol] = equity

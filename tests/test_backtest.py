@@ -8,6 +8,7 @@ from backtest import strategies
 from backtest.__main__ import main
 from backtest.config import BacktestSettings
 from backtest.engine import Costs, simulate
+from backtest.metrics import bar_labels
 from backtest.runner import run, setup
 from cloud import Cloud, CloudSettings
 from ingestion.dukascopy.config import Settings
@@ -90,6 +91,23 @@ def test_open_position_closed_on_last_bar():
     trades, equity = simulate(bars, signal_frame(3, (0, 1, 9, np.nan)), NO_COSTS, 1000, 0.1)
     assert trades.iloc[0].exit_reason == "end" and trades.iloc[0].exit_price == 10.2
     assert equity["position"].iloc[-1] == 0 and equity["equity"].iloc[-1] == pytest.approx(1000 + 100 * 0.2)
+
+
+def test_bar_labels_mark_entry_open_close_and_flat():
+    bars = make_bars([(10, 10, 10, 10), (10, 10, 10, 10), (10, 10, 10, 10), (10, 10, 8, 10), (10, 10, 10, 10)])
+    trades, equity = simulate(bars, signal_frame(5, (0, -1, 11, 8)), NO_COSTS, 1000, 0.1)
+    labels = bar_labels(equity, trades, contract_size=100)
+    assert list(labels["side"]) == ["-", "SHORT", "SHORT", "-", "-"]
+    assert list(labels["lots"]) == [0, 1, 1, 0, 0]  # 100 units short = 1 lot
+    assert list(labels["note"]) == ["flat", "entry", "open", "closed: target (+200.00)", "flat"]
+
+
+def test_bar_labels_show_trade_that_opens_and_stops_in_one_bar():
+    bars = make_bars([(10, 10, 10, 10), (10, 10, 8, 10), (10, 10, 10, 10)])
+    trades, equity = simulate(bars, signal_frame(3, (0, 1, 9, 12)), NO_COSTS, 1000, 0.1)
+    labels = bar_labels(equity, trades, contract_size=100_000)
+    assert list(equity["position"]) == [0, 0, 0]
+    assert list(labels["note"]) == ["flat", "entry+closed: stop (-100.00)", "flat"]
 
 
 # --- strategies ---
@@ -184,6 +202,11 @@ def test_run_stores_results_and_rerun_replaces_them(env):
     assert first["trades"] == sum(m["n_trades"] for m in result["metrics"][:2]) > 0
     runs = cloud.bq.query("SELECT status, data_cutoff, params_json FROM backtest.runs WHERE run_id = @r", {"r": rid})
     assert runs["status"][0] == "done" and runs["data_cutoff"][0] is not None
+
+    # Every closed trade shows up as a "closed" note on its exit bar
+    closed = cloud.bq.query("SELECT COUNT(*) AS n FROM backtest.equity WHERE run_id = @r AND note LIKE '%closed:%'",
+                            {"r": rid})
+    assert closed["n"][0] == first["trades"]
 
     run(*args, run_id=rid)
     assert counts() == first

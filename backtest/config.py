@@ -11,6 +11,11 @@ from dataclasses import dataclass, field
 
 from ingestion.dukascopy.config import _point_overrides
 
+# Units in one standard lot, used only to report position size in lots. Anything not
+# listed is 100,000 (FX); set others with BACKTEST_CONTRACT_SIZES, e.g. "BTCUSD=1".
+DEFAULT_CONTRACT_SIZE = 100_000
+KNOWN_CONTRACT_SIZES: dict[str, int] = {"XAUUSD": 100, "XAGUSD": 5_000}
+
 try:
     from dotenv import load_dotenv
 
@@ -29,6 +34,7 @@ class BacktestSettings:
     spread_points: float = 10.0
     spread_overrides: dict[str, int] = field(default_factory=dict)
     commission_rate: float = 0.0  # fraction of notional, charged on entry and on exit
+    contract_size_overrides: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def from_env(cls) -> "BacktestSettings":
@@ -40,6 +46,7 @@ class BacktestSettings:
             spread_points=float(env("BACKTEST_SPREAD_POINTS", "10")),
             spread_overrides=_point_overrides(env("BACKTEST_SPREAD_OVERRIDES")),
             commission_rate=float(env("BACKTEST_COMMISSION_RATE", "0")),
+            contract_size_overrides=_point_overrides(env("BACKTEST_CONTRACT_SIZES")),
         )
 
     def validate(self) -> None:
@@ -53,3 +60,8 @@ class BacktestSettings:
     def spread_for(self, symbol: str) -> float:
         """Spread in points for one symbol."""
         return float(self.spread_overrides.get(symbol.upper(), self.spread_points))
+
+    def contract_size_for(self, symbol: str) -> int:
+        """Units in one lot for one symbol."""
+        symbol = symbol.upper()
+        return self.contract_size_overrides.get(symbol, KNOWN_CONTRACT_SIZES.get(symbol, DEFAULT_CONTRACT_SIZE))

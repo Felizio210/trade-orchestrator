@@ -55,6 +55,9 @@ EQUITY_SCHEMA = [
     Field("position", "FLOAT64", "REQUIRED"),  # signed qty
     Field("equity", "FLOAT64", "REQUIRED"),
     Field("drawdown", "FLOAT64", "REQUIRED"),  # equity / running peak - 1
+    Field("side", "STRING"),  # LONG | SHORT | - (flat)
+    Field("lots", "FLOAT64"),  # |position| / contract size, 2 decimals
+    Field("note", "STRING"),  # entry | open | flat | closed: <reason> (<pnl>)
 ]
 
 METRICS_SCHEMA = [
