@@ -5,6 +5,7 @@ from datetime import timedelta
 import dlh_tasks
 import pendulum
 from airflow import DAG
+from airflow.datasets import Dataset
 from airflow.operators.python import PythonOperator, ShortCircuitOperator
 
 with DAG(
@@ -18,6 +19,7 @@ with DAG(
 ) as dag:
     trading_day = ShortCircuitOperator(task_id="trading_day", python_callable=dlh_tasks.is_trading_day)
     download_publish = PythonOperator(task_id="download_publish", python_callable=dlh_tasks.download_publish)
-    load = PythonOperator(task_id="load", python_callable=dlh_tasks.load)
+    # Emits the market bars Dataset on success, which triggers backtest_daily
+    load = PythonOperator(task_id="load", python_callable=dlh_tasks.load, outlets=[Dataset(dlh_tasks.MARKET_BARS)])
 
     trading_day >> download_publish >> load

@@ -72,3 +72,55 @@ def load(**_) -> dict:
     if result["failed"]:
         raise RuntimeError(f"{len(result['failed'])} messages failed to load: {result['failed'][:3]}")
     return {"loaded": len(result["loaded"])}
+
+
+# --- backtest ---
+
+MARKET_BARS = "dlh://market/bars"  # Dataset URI: dukascopy_daily's load emits it, backtest_daily runs on it
+
+
+def backtest_jobs() -> list[tuple[str, str]]:
+    """(strategy, timeframe) pairs from BACKTEST_DAILY_RUNS, e.g. "supply_demand:1h,trendline:1h".
+
+    Read when the DAG is parsed (one task per pair), so it only uses os.environ.
+    """
+    raw = os.environ.get("BACKTEST_DAILY_RUNS") or "supply_demand:1h"
+    jobs = []
+    for item in (part.strip() for part in raw.split(",") if part.strip()):
+        strategy, sep, timeframe = item.partition(":")
+        jobs.append((strategy.strip(), timeframe.strip() if sep else "1h"))
+    return jobs
+
+
+def _backtest():
+    if str(PROJECT_DIR) not in sys.path:
+        sys.path.insert(0, str(PROJECT_DIR))
+    from backtest import runner
+    from backtest.config import BacktestSettings
+    from cloud import Cloud
+    from ingestion.dukascopy.config import Settings
+
+    return runner, BacktestSettings.from_env(), Settings.from_env(), Cloud.from_env()
+
+
+def backtest_setup(**_) -> list[str]:
+    runner, settings, _market, cloud = _backtest()
+    return runner.setup(settings, cloud)
+
+
+def backtest(strategy: str, timeframe: str, ds: str, **_) -> dict:
+    """Backtest the last BACKTEST_DAILY_LOOKBACK_DAYS days up to `ds` on DUKASCOPY_SYMBOLS.
+
+    The run_id is fixed per strategy, timeframe and day, so a retry or a re-run of the
+    same day replaces its results instead of adding another run.
+    """
+    from datetime import timedelta
+
+    runner, settings, market, cloud = _backtest()
+    end = date.fromisoformat(ds)
+    start = end - timedelta(days=int(os.environ.get("BACKTEST_DAILY_LOOKBACK_DAYS", "730")))
+    result = runner.run(strategy, market.symbols, timeframe, start, end, settings, market, cloud,
+                        run_id=f"daily-{strategy}-{timeframe}-{ds}")
+    return {"run_id": result["run_id"],
+            "metrics": {m["symbol"]: {k: m[k] for k in ("n_trades", "total_return", "max_drawdown", "sharpe")}
+                        for m in result["metrics"]}}
