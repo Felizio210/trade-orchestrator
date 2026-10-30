@@ -263,21 +263,12 @@ def test_repair_task_fills_gaps_and_retries_incomplete(tmp_path, monkeypatch):
 
     monkeypatch.setattr(DukascopyClient, "fetch_hour_raw", fetch)
 
-    class TI:
-        def __init__(self, value):
-            self.value = value
-
-        def xcom_pull(self, task_ids):
-            return self.value
-
     with pytest.raises(RuntimeError, match="EURUSD 2026-09-06: 1 bad files: ERROR x1"):
         dlh_tasks.repair(ds="2026-09-06")
 
     broken.clear()
     result = dlh_tasks.repair(ds="2026-09-06")
     assert (result["start"], result["existing"], result["published"]) == ("2026-09-04", 1, ["EURUSD 2026-09-06"])
-    assert dlh_tasks.repaired(TI(result))
 
     result = dlh_tasks.repair(ds="2026-09-06")
     assert (result["existing"], result["published"], result["loaded"]) == (2, [], 0)
-    assert not dlh_tasks.repaired(TI(result))

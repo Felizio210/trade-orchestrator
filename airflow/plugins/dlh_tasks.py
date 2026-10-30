@@ -98,14 +98,9 @@ def repair(ds: str, **_) -> dict:
     return summary
 
 
-def repaired(ti, **_) -> bool:
-    """True if repair loaded anything, so backtest_daily only re-runs when bars changed."""
-    return bool(ti.xcom_pull(task_ids="repair")["loaded"])
-
-
 # --- backtest ---
 
-MARKET_BARS = "dlh://market/bars"  # Dataset URI: dukascopy_daily's load emits it, backtest_daily runs on it
+MARKET_BARS = "dlh://market/bars"  # Dataset URI: dukascopy_repair emits it, backtest_daily runs on it
 
 
 def backtest_jobs() -> list[tuple[str, str]]:

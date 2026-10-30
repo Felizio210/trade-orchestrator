@@ -43,7 +43,8 @@ source airflow/env.sh                          # required before any other `airf
   (simulation), `metrics.py`, `runner.py` (load → signals → simulate → metrics → write),
   `tables.py`. Design notes in `docs/backtest_plan.md`.
 - `airflow/dags/` — `dukascopy_daily` (02:00 UTC), `dukascopy_repair` (09:00 UTC gap fill),
-  `dukascopy_setup` (manual), `backtest_daily` (triggered by the `dlh://market/bars` Dataset).
+  `dukascopy_setup` (manual), `backtest_daily` (triggered by the `dlh://market/bars` Dataset, which only `dukascopy_repair` emits,
+  once the repair window has no gaps).
   DAG files stay thin: all logic lives in `airflow/plugins/dlh_tasks.py`, which imports
   heavy modules inside functions so the scheduler parses DAGs cheaply.
 

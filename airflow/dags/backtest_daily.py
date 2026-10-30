@@ -1,4 +1,4 @@
-"""Re-runs the backtests in BACKTEST_DAILY_RUNS each time dukascopy_daily loads new bars.
+"""Re-runs the backtests in BACKTEST_DAILY_RUNS after each dukascopy_repair run that leaves no gaps.
 
 One task per (strategy, timeframe); results land in the backtest dataset under
 run_id daily-{strategy}-{timeframe}-{ds}. Logic lives in plugins/dlh_tasks.py.
@@ -14,7 +14,7 @@ from airflow.operators.python import PythonOperator
 
 with DAG(
     dag_id="backtest_daily",
-    schedule=[Dataset(dlh_tasks.MARKET_BARS)],  # after every successful dukascopy_daily load
+    schedule=[Dataset(dlh_tasks.MARKET_BARS)],  # after dukascopy_repair has filled any gaps
     start_date=pendulum.datetime(2026, 10, 1, tz="UTC"),
     catchup=False,
     max_active_runs=1,

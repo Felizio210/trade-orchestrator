@@ -1,7 +1,8 @@
 # Backtest: implementation plan
 
 Status: **done**: `python -m backtest --help`, and `airflow/dags/backtest_daily.py` re-runs
-`BACKTEST_DAILY_RUNS` after every `dukascopy_daily` load (Airflow Dataset `dlh://market/bars`).
+`BACKTEST_DAILY_RUNS` after each `dukascopy_repair` run, once missing days are filled (Airflow
+Dataset `dlh://market/bars`).
 Strategies: `supply_demand`, `trendline`.
 
 ## Goal
@@ -53,7 +54,7 @@ backtest/
   engine.py     simulate(bars, signals, costs) -> trades, equity
   metrics.py    compute(trades, equity, timeframe) -> metrics rows
   runner.py     run(): load -> signals -> simulate -> metrics -> write, records status
-airflow/dags/backtest_daily.py   runs after each dukascopy_daily load
+airflow/dags/backtest_daily.py   runs after each gap-free dukascopy_repair
 tests/test_backtest.py           engine/metrics unit tests + local end-to-end run
 ```
 

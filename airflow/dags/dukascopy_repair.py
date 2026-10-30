@@ -3,6 +3,9 @@
 dukascopy_daily has catchup=False, so days the scheduler was down are never run, and a run
 that fails all its retries stays failed. This catches both. Logic lives in plugins/dlh_tasks.py.
 Large historical backfills stay manual: `python -m ingestion.dukascopy backfill`.
+
+It is also what triggers backtest_daily: once the window has no gaps left, so backtests never
+run over missing days.
 """
 
 from datetime import timedelta
@@ -24,9 +27,11 @@ with DAG(
     default_args={"retries": 2, "retry_delay": timedelta(hours=1), "execution_timeout": timedelta(hours=2)},
     tags=["dukascopy"],
 ) as dag:
+    # Fails while any day in the window is still incomplete, so notify only runs on a gap-free window
     repair = PythonOperator(task_id="repair", python_callable=dlh_tasks.repair)
-    repaired = ShortCircuitOperator(task_id="repaired", python_callable=dlh_tasks.repaired)
-    # Emits the market bars Dataset only when bars were added, which triggers backtest_daily
+    # No new bars for a Saturday, so no backtest either
+    trading_day = ShortCircuitOperator(task_id="trading_day", python_callable=dlh_tasks.is_trading_day)
+    # Emits the market bars Dataset, which triggers backtest_daily
     notify = EmptyOperator(task_id="notify", outlets=[Dataset(dlh_tasks.MARKET_BARS)])
 
-    repair >> repaired >> notify
+    repair >> trading_day >> notify
