@@ -49,8 +49,40 @@ CANDLE_SIDES = ("BID", "ASK")
 RETRY_STATUS = {429, 500, 502, 503, 504}
 
 
+# Error kinds recorded in the manifest, with what each usually means
+ERROR_HINTS = {
+    "SSL": "HTTPS is being intercepted (ISP filter, firewall or proxy); try another network, a VPN, or GCP",
+    "DNS": "can't resolve the Dukascopy host: offline, DNS down, or blocked by the ISP",
+    "TIMEOUT": "Dukascopy didn't answer in time: slow network or Dukascopy overloaded",
+    "CONNECTION": "couldn't connect: offline, firewall, or Dukascopy blocked on this network",
+    "RATE_LIMIT": "rate limited (HTTP 429): wait, and keep DUKASCOPY_MAX_WORKERS low",
+    "SERVER": "Dukascopy server error (HTTP 5xx): usually temporary",
+    "HTTP": "unexpected HTTP status from Dukascopy",
+    "CORRUPT": "response isn't a valid .bi5 file: block/proxy page or truncated download",
+    "ERROR": "unclassified download error",
+}
+
+
 class DukascopyError(RuntimeError):
-    pass
+    def __init__(self, message: str, kind: str = "ERROR"):
+        super().__init__(message)
+        self.kind = kind
+
+
+def error_kind(exc: requests.RequestException) -> str:
+    """SSL / DNS / TIMEOUT / CONNECTION / ERROR for a requests exception."""
+    if isinstance(exc, requests.exceptions.SSLError):
+        return "SSL"
+    if isinstance(exc, requests.Timeout):
+        return "TIMEOUT"
+    if isinstance(exc, requests.ConnectionError):
+        text = str(exc)
+        return "DNS" if "NameResolutionError" in text or "Failed to resolve" in text else "CONNECTION"
+    return "ERROR"
+
+
+def status_kind(status: int) -> str:
+    return "RATE_LIMIT" if status == 429 else "SERVER" if status >= 500 else "HTTP"
 
 
 def hour_url(base_url: str, symbol: str, hour: datetime) -> str:
@@ -147,15 +179,16 @@ class DukascopyClient:
             try:
                 resp = self.session.get(url, timeout=self.settings.timeout_s)
             except requests.RequestException as exc:
-                err: object = exc
+                kind, err = error_kind(exc), exc
                 delay = min(self.settings.error_backoff_s * 2**attempt, 120)
             else:
                 if resp.status_code == 200:
                     return resp.content
                 if resp.status_code == 404:
                     return b""
+                kind = status_kind(resp.status_code)
                 if resp.status_code not in RETRY_STATUS:
-                    raise DukascopyError(f"HTTP {resp.status_code} for {url}")
+                    raise DukascopyError(f"[{kind}] HTTP {resp.status_code} for {url}", kind)
                 err = f"HTTP {resp.status_code}"
                 if resp.status_code == 429:
                     delay = _retry_after(resp) or min(self.settings.rate_limit_backoff_s * 2**attempt, 300)
@@ -163,8 +196,8 @@ class DukascopyClient:
                 else:
                     delay = min(self.settings.error_backoff_s * 2**attempt, 120)
             if attempt == self.settings.max_retries:
-                raise DukascopyError(f"Giving up on {url} after {attempt + 1} attempts: {err}")
-            log.warning("Retrying %s in %.0fs (%s)", url, delay, err)
+                raise DukascopyError(f"[{kind}] Giving up on {url} after {attempt + 1} attempts: {err}", kind)
+            log.warning("Retrying %s in %.0fs [%s] (%s)", url, delay, kind, err)
             time.sleep(delay)
         raise AssertionError("unreachable")
 

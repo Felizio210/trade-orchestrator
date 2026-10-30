@@ -51,3 +51,59 @@ def test_ticks_to_bars():
     first = bars.iloc[0]
     assert (first.open, first.high, first.low, first.close) == (1.0, 3.0, 1.0, 2.0)
     assert first.volume == 6.0
+
+
+def _client_raising(monkeypatch, outcome):
+    """A client whose every GET raises `outcome` (an exception) or returns it (a status code)."""
+    import requests
+
+    from ingestion.dukascopy.client import DukascopyClient
+    from ingestion.dukascopy.config import Settings
+
+    client = DukascopyClient(Settings(max_retries=1, error_backoff_s=0, min_interval_s=0))
+
+    def get(url, timeout):
+        if isinstance(outcome, Exception):
+            raise outcome
+        resp = requests.Response()
+        resp.status_code = outcome
+        return resp
+
+    monkeypatch.setattr(client.session, "get", get)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    return client
+
+
+def test_download_errors_carry_their_kind(monkeypatch):
+    import pytest
+    import requests
+
+    from ingestion.dukascopy.client import DukascopyError
+
+    cases = {
+        "SSL": requests.exceptions.SSLError("certificate verify failed: Hostname mismatch"),
+        "DNS": requests.ConnectionError("NameResolutionError: Failed to resolve 'datafeed.dukascopy.com'"),
+        "TIMEOUT": requests.exceptions.ReadTimeout("Read timed out"),
+        "CONNECTION": requests.ConnectionError("Connection refused"),
+        "SERVER": 503,
+        "HTTP": 403,
+    }
+    for kind, outcome in cases.items():
+        with pytest.raises(DukascopyError, match=rf"^\[{kind}\]") as info:
+            _client_raising(monkeypatch, outcome).fetch_hour_raw("EURUSD", HOUR)
+        assert info.value.kind == kind
+
+
+def test_problem_summary_groups_by_kind():
+    from ingestion.dukascopy.downloader import problem_summary
+
+    manifest = {"hours": [
+        {"side": "BID", "status": "failed", "kind": "SSL", "error": "x"},
+        {"side": "ASK", "status": "failed", "kind": "SSL", "error": "x"},
+        {"hour": "03", "status": "corrupt", "kind": "CORRUPT", "error": "x"},
+        {"hour": "04", "status": "failed", "error": "x"},  # old manifest, no kind
+        {"hour": "05", "status": "ok"},
+    ]}
+    summary = problem_summary(manifest)
+    assert summary.startswith("4 bad files: SSL x2 (HTTPS is being intercepted")
+    assert "CORRUPT x1 (" in summary and "ERROR x1 (" in summary

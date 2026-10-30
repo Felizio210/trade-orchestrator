@@ -43,7 +43,7 @@ def download_publish(ds: str, **_) -> dict:
     """
     pipeline, settings, cloud = _pipeline()
     from ingestion.dukascopy.client import DukascopyClient
-    from ingestion.dukascopy.downloader import download_day, problems
+    from ingestion.dukascopy.downloader import download_day, problem_summary, problems
 
     settings.validate()
     day = date.fromisoformat(ds)
@@ -56,7 +56,7 @@ def download_publish(ds: str, **_) -> dict:
             continue
         manifest = download_day(symbol, day, settings, client=client)
         if problems(manifest):
-            incomplete.append(f"{symbol}: {len(problems(manifest))} failed/corrupt files")
+            incomplete.append(f"{symbol}: {problem_summary(manifest)}")
             continue
         pipeline.publish_day(symbol, day, settings, cloud)
         published.append(symbol)
@@ -72,6 +72,35 @@ def load(**_) -> dict:
     if result["failed"]:
         raise RuntimeError(f"{len(result['failed'])} messages failed to load: {result['failed'][:3]}")
     return {"loaded": len(result["loaded"])}
+
+
+def repair(ds: str, **_) -> dict:
+    """Backfill any day missing from the last DUKASCOPY_REPAIR_DAYS days up to `ds`.
+
+    Covers days dukascopy_daily never ran (catchup=False skips downtime) and days whose
+    run failed. Days already in the lake are skipped, so a quiet day costs a few lookups.
+    Days still incomplete fail the task at the end so Airflow retries them.
+    """
+    from datetime import timedelta
+
+    pipeline, settings, cloud = _pipeline()
+    end = date.fromisoformat(ds)
+    start = end - timedelta(days=int(os.environ.get("DUKASCOPY_REPAIR_DAYS", "7")) - 1)
+    result = pipeline.backfill_range(settings.symbols, start, end, settings, cloud)
+    summary = {"start": start.isoformat(), "end": end.isoformat(), "existing": result["existing"],
+               "published": [f"{p['symbol']} {p['date']}" for p in result["published"]],
+               "loaded": len(result["loaded"])}
+    problems = [f"{s['symbol']} {s['date']}: {s['summary']}" for s in result["skipped"]]
+    if result["failed"]:
+        problems.append(f"{len(result['failed'])} messages failed to load")
+    if problems:
+        raise RuntimeError(f"repair incomplete, will retry: {'; '.join(problems)} ({summary})")
+    return summary
+
+
+def repaired(ti, **_) -> bool:
+    """True if repair loaded anything, so backtest_daily only re-runs when bars changed."""
+    return bool(ti.xcom_pull(task_ids="repair")["loaded"])
 
 
 # --- backtest ---

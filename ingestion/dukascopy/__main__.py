@@ -218,7 +218,7 @@ def main(argv: list[str] | None = None) -> None:
         result = backfill_range(symbols, args.start, end, settings, cloud, force=args.force,
                                 on_month_done=progress)
         for s in result["skipped"]:
-            print(f"INCOMPLETE {s['symbol']} {s['date']}: {'; '.join(s['problems'])[:200]}")
+            print(f"INCOMPLETE {s['symbol']} {s['date']}: {s['summary']}")
         for item in result["failed"]:
             print(f"FAILED     message {item['message_id']}: {item['error']}")
         if result["skipped"] or result["failed"]:

@@ -107,11 +107,11 @@ def test_publish_refuses_incomplete_day(env, monkeypatch):
 
     def fetch(symbol, hour):
         if hour.hour == 5:
-            raise DukascopyError("connection refused")
+            raise DukascopyError("connection refused", "CONNECTION")
         return BLOB if hour.hour == 10 else b""
 
     download(settings, monkeypatch, fetch)
-    with pytest.raises(IncompleteDayError, match="1 failed"):
+    with pytest.raises(IncompleteDayError, match=r"1 bad files: CONNECTION x1 \(couldn.t connect"):
         publish_day("EURUSD", DAY, settings, cloud)
     assert publish_day("EURUSD", DAY, settings, cloud, allow_partial=True)["published"]
 
@@ -238,3 +238,46 @@ def test_candle_source_failed_side_blocks_publish(candle_env, monkeypatch):
 def test_candle_source_requires_bars_only():
     with pytest.raises(ValueError, match="DATASETS=bars"):
         Settings(bar_source="candles").validate()
+
+
+def test_repair_task_fills_gaps_and_retries_incomplete(tmp_path, monkeypatch):
+    import sys
+    from pathlib import Path
+
+    from ingestion.dukascopy import pipeline
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "airflow" / "plugins"))
+    import dlh_tasks
+
+    settings = Settings(local_data_dir=str(tmp_path / "data"), symbols=["EURUSD"])
+    cloud = Cloud(CloudSettings(env="local", local_dir=str(tmp_path / ".local_gcp")))
+    setup(settings, cloud)
+    monkeypatch.setattr(dlh_tasks, "_pipeline", lambda: (pipeline, settings, cloud))
+    monkeypatch.setenv("DUKASCOPY_REPAIR_DAYS", "3")  # Fri 09-04 .. Sun 09-06
+    broken = {date(2026, 9, 6)}
+
+    def fetch(self, symbol, hour):
+        if hour.date() in broken and hour.hour == 3:
+            raise DukascopyError("HTTP 429")
+        return BLOB if hour.hour == 10 else b""
+
+    monkeypatch.setattr(DukascopyClient, "fetch_hour_raw", fetch)
+
+    class TI:
+        def __init__(self, value):
+            self.value = value
+
+        def xcom_pull(self, task_ids):
+            return self.value
+
+    with pytest.raises(RuntimeError, match="EURUSD 2026-09-06: 1 bad files: ERROR x1"):
+        dlh_tasks.repair(ds="2026-09-06")
+
+    broken.clear()
+    result = dlh_tasks.repair(ds="2026-09-06")
+    assert (result["start"], result["existing"], result["published"]) == ("2026-09-04", 1, ["EURUSD 2026-09-06"])
+    assert dlh_tasks.repaired(TI(result))
+
+    result = dlh_tasks.repair(ds="2026-09-06")
+    assert (result["existing"], result["published"], result["loaded"]) == (2, [], 0)
+    assert not dlh_tasks.repaired(TI(result))

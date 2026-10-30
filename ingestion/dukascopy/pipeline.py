@@ -27,7 +27,7 @@ from ingestion.dukascopy.client import DukascopyClient
 from ingestion.dukascopy.config import Settings
 from ingestion.dukascopy.client import CANDLE_SIDES, decode_candles
 from ingestion.dukascopy.converter import read_day_dir
-from ingestion.dukascopy.downloader import candle_path, download_day, problems, raw_day_dir
+from ingestion.dukascopy.downloader import candle_path, download_day, problem_summary, problems, raw_day_dir
 from ingestion.dukascopy.instruments import point_factor
 from ingestion.dukascopy.tables import CLUSTER_FIELDS, PARTITION_FIELD, bq_table_id, dataset_name, schema_for, shape
 from ingestion.dukascopy.transform import candles_to_bars, resample_bars, ticks_to_bars
@@ -111,7 +111,7 @@ def publish_day(
     manifest = json.loads(manifest_path.read_text())
     if problems(manifest) and not allow_partial:
         raise IncompleteDayError(
-            f"{symbol} {day} has {len(problems(manifest))} failed/corrupt hours; re-run download, "
+            f"{symbol} {day} has {problem_summary(manifest)}; re-run download, "
             "or publish with allow_partial"
         )
 
@@ -233,7 +233,8 @@ def run_range(
         for symbol in symbols:
             manifest = download_day(symbol, day, settings)
             if problems(manifest) and not allow_partial:
-                skipped.append({"symbol": symbol, "date": day.isoformat(), "problems": problems(manifest)})
+                skipped.append({"symbol": symbol, "date": day.isoformat(), "problems": problems(manifest),
+                                "summary": problem_summary(manifest)})
                 continue
             published.append(publish_day(symbol, day, settings, cloud, allow_partial=allow_partial))
         day += timedelta(days=1)
@@ -286,7 +287,8 @@ def backfill_range(
                 manifest = download_day(symbol, day, settings, client=client)
                 if problems(manifest):
                     result["skipped"].append({"symbol": symbol, "date": day.isoformat(),
-                                              "problems": problems(manifest)})
+                                              "problems": problems(manifest),
+                                              "summary": problem_summary(manifest)})
                     continue
                 result["published"].append(publish_day(symbol, day, settings, cloud))
         day += timedelta(days=1)

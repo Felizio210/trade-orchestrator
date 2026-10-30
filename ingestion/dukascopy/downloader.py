@@ -24,7 +24,9 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from ingestion.dukascopy.client import CANDLE_SIDES, DukascopyClient, DukascopyError, decode_candles, decode_ticks
+from ingestion.dukascopy.client import (
+    CANDLE_SIDES, ERROR_HINTS, DukascopyClient, DukascopyError, decode_candles, decode_ticks,
+)
 from ingestion.dukascopy.config import Settings
 from ingestion.dukascopy.instruments import point_factor
 
@@ -79,13 +81,13 @@ def download_day(
             try:
                 raw = client.fetch_hour_raw(symbol, hour)
             except DukascopyError as exc:
-                return {**entry, "status": "failed", "error": str(exc)}
+                return {**entry, "status": "failed", "kind": exc.kind, "error": str(exc)}
         entry["bytes"] = len(raw)
         try:
             ticks = decode_ticks(raw, hour, factor)
         except Exception as exc:  # lzma.LZMAError, DukascopyError, ...
             path.unlink(missing_ok=True)
-            return {**entry, "status": "corrupt", "error": f"{type(exc).__name__}: {exc}"}
+            return {**entry, "status": "corrupt", "kind": "CORRUPT", "error": f"{type(exc).__name__}: {exc}"}
         if ticks.empty:
             path.unlink(missing_ok=True)
             return {**entry, "status": "empty", "ticks": 0}
@@ -158,13 +160,13 @@ def download_day_candles(
             try:
                 raw = client.fetch_candles_raw(symbol, day, side)
             except DukascopyError as exc:
-                return {**entry, "status": "failed", "error": str(exc)}
+                return {**entry, "status": "failed", "kind": exc.kind, "error": str(exc)}
         entry["bytes"] = len(raw)
         try:
             candles = decode_candles(raw, day, factor)
         except Exception as exc:
             path.unlink(missing_ok=True)
-            return {**entry, "status": "corrupt", "error": f"{type(exc).__name__}: {exc}"}
+            return {**entry, "status": "corrupt", "kind": "CORRUPT", "error": f"{type(exc).__name__}: {exc}"}
         traded = candles[candles["volume"] > 0]
         if traded.empty:
             path.unlink(missing_ok=True)
@@ -211,6 +213,17 @@ def problems(manifest: dict) -> list[str]:
             if e["status"] in ("corrupt", "failed")]
 
 
+def problem_summary(manifest: dict) -> str:
+    """Bad files grouped by error kind, e.g. "2 bad files: SSL x2 (HTTPS is being intercepted ...)"."""
+    kinds: dict[str, int] = {}
+    for e in manifest["hours"]:
+        if e["status"] in ("corrupt", "failed"):
+            kind = e.get("kind", "ERROR")  # manifests written before kinds were recorded
+            kinds[kind] = kinds.get(kind, 0) + 1
+    parts = [f"{kind} x{n} ({ERROR_HINTS.get(kind, ERROR_HINTS['ERROR'])})" for kind, n in kinds.items()]
+    return f"{sum(kinds.values())} bad files: " + "; ".join(parts)
+
+
 def download_range(
     symbols: list[str], start: date, end: date, settings: Settings | None = None, *, overwrite: bool = False
 ) -> list[dict]:
@@ -224,7 +237,7 @@ def download_range(
             manifests.append(m)
             if m["hours_failed"] == len(m["hours"]):
                 raise DukascopyError(
-                    f"Every hour of {symbol} {day} failed to download ({m['hours'][0]['error']}). "
+                    f"Every hour of {symbol} {day} failed to download: {problem_summary(m)}. "
                     "The datafeed looks unreachable from this network; run "
                     "`python -m ingestion.dukascopy check` to diagnose."
                 )
