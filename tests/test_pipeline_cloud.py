@@ -2,7 +2,7 @@
 
 import json
 import lzma
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 import pytest
@@ -12,7 +12,7 @@ from ingestion.dukascopy.client import CANDLE_DTYPE, TICK_DTYPE, DukascopyClient
 from ingestion.dukascopy.config import Settings
 from ingestion.dukascopy.downloader import download_day, problems
 from ingestion.dukascopy.pipeline import (
-    IncompleteDayError, backfill_range, lake_uri, load_pending, publish_day, setup,
+    IncompleteDayError, backfill_range, lake_uri, last_complete_day, load_pending, publish_day, run_range, setup,
 )
 
 DAY = date(2026, 9, 3)
@@ -114,6 +114,29 @@ def test_publish_refuses_incomplete_day(env, monkeypatch):
     with pytest.raises(IncompleteDayError, match=r"1 bad files: CONNECTION x1 \(couldn.t connect"):
         publish_day("EURUSD", DAY, settings, cloud)
     assert publish_day("EURUSD", DAY, settings, cloud, allow_partial=True)["published"]
+
+
+def test_unfinished_day_is_never_published(env, monkeypatch):
+    """Hours that haven't happened yet download as empty, so today's manifest looks clean."""
+    settings, cloud = env
+    today = datetime.now(timezone.utc).date()
+    client = DukascopyClient(settings)
+    calls = []
+    monkeypatch.setattr(client, "fetch_hour_raw", lambda s, h: calls.append(h.date()) or (BLOB if h.hour == 10 else b""))
+    download_day("EURUSD", today, settings, client=client)
+    assert last_complete_day() == today - timedelta(days=1)
+
+    with pytest.raises(IncompleteDayError, match="hasn't ended yet"):
+        publish_day("EURUSD", today, settings, cloud)
+
+    calls.clear()
+    result = backfill_range(["EURUSD"], today - timedelta(days=1), today, settings, cloud, client=client)
+    assert today not in calls  # stops at yesterday, which the next run treats as new
+    assert not any(cloud.storage.exists(lake_uri(settings, d, "EURUSD", today)) for d in ("ticks", "bars_1h"))
+    assert today.isoformat() not in [p["date"] for p in result["published"]]
+
+    assert run_range(["EURUSD"], today, today, settings, cloud, load=False)["skipped"] == [
+        {"symbol": "EURUSD", "date": today.isoformat(), "problems": [], "summary": "day hasn't ended yet (UTC)"}]
 
 
 def test_publish_requires_download(env):

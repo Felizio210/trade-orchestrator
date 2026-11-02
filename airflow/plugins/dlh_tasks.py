@@ -106,7 +106,7 @@ def repair(ds: str, **_) -> dict:
 
     pipeline, settings, cloud = _pipeline()
     settings = _ticks(settings)
-    end = date.fromisoformat(ds)
+    end = min(date.fromisoformat(ds), pipeline.last_complete_day())  # a manual run's ds is today
     start = end - timedelta(days=int(os.environ.get("DUKASCOPY_REPAIR_DAYS", "7")) - 1)
     result = pipeline.backfill_range(settings.symbols, start, end, settings, cloud)
     summary = {"start": start.isoformat(), "end": end.isoformat(), "existing": result["existing"],

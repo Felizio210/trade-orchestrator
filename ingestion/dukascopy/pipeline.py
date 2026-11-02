@@ -39,6 +39,13 @@ class IncompleteDayError(RuntimeError):
     pass
 
 
+def last_complete_day(now: datetime | None = None) -> date:
+    """Yesterday in UTC. Later days are still open: hours that haven't happened yet download
+    as empty, so the manifest looks clean, and the lake would keep a partial day for good
+    (finalize and backfill skip days that are already there)."""
+    return (now or datetime.now(timezone.utc)).astimezone(timezone.utc).date() - timedelta(days=1)
+
+
 def _dataset_names(settings: Settings) -> list[str]:
     names = []
     for kind in settings.datasets:
@@ -97,8 +104,8 @@ def publish_day(
 ) -> dict:
     """Upload one downloaded day to GCS and announce each file on Pub/Sub.
 
-    Refuses days whose download had failed/corrupt hours (so BigQuery never gets a
-    silently incomplete day) unless allow_partial=True. upload_raw defaults to settings.upload_raw.
+    Refuses days whose download had failed/corrupt hours, and days that haven't ended yet
+    (UTC), so BigQuery never gets a silently incomplete day, unless allow_partial=True. upload_raw defaults to settings.upload_raw.
     """
     settings.validate()
     if upload_raw is None:
@@ -108,6 +115,8 @@ def publish_day(
     manifest_path = day_dir / "_manifest.json"
     if not manifest_path.exists():
         raise FileNotFoundError(f"{manifest_path} not found; run `download` for {symbol} {day} first")
+    if day > last_complete_day() and not allow_partial:
+        raise IncompleteDayError(f"{symbol} {day} hasn't ended yet (UTC); publish it tomorrow, or with allow_partial")
     manifest = json.loads(manifest_path.read_text())
     if problems(manifest) and not allow_partial:
         raise IncompleteDayError(
@@ -285,11 +294,16 @@ def run_range(
     load: bool = True,
     allow_partial: bool = False,
 ) -> dict:
-    """download -> publish (-> load) for every symbol/day. Incomplete days are skipped, not published."""
+    """download -> publish (-> load) for every symbol/day. Incomplete days, and days that haven't
+    ended yet, are skipped, not published."""
     published, skipped = [], []
     day = start
     while day <= end:
         for symbol in symbols:
+            if day > last_complete_day() and not allow_partial:
+                skipped.append({"symbol": symbol, "date": day.isoformat(), "problems": [],
+                                "summary": "day hasn't ended yet (UTC)"})
+                continue
             manifest = download_day(symbol, day, settings)
             if problems(manifest) and not allow_partial:
                 skipped.append({"symbol": symbol, "date": day.isoformat(), "problems": problems(manifest),
@@ -319,9 +333,13 @@ def backfill_range(
     Skips Saturdays (FX and metals never trade, and empty hours are never cached, so they
     would be re-requested on every run) and days whose lake file already exists unless
     force=True. Incomplete days are skipped, not published, so a re-run retries just those.
+    Stops at yesterday (UTC): today hasn't ended, so the next run picks it up.
     Loads after every month, so BigQuery fills up as it goes.
     """
     settings.validate()
+    if end > last_complete_day():
+        log.info("backfill: %s hasn't ended yet, stopping at %s", end, last_complete_day())
+        end = last_complete_day()
     client = client or DukascopyClient(settings)
     datasets = _dataset_names(settings)
     result: dict = {"published": [], "skipped": [], "existing": 0, "loaded": [], "failed": []}
