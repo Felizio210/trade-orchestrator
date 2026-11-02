@@ -274,10 +274,8 @@ def test_repair_task_fills_gaps_and_retries_incomplete(tmp_path, monkeypatch):
     assert (result["existing"], result["published"], result["loaded"]) == (2, [], 0)
 
 
-def test_hourly_task_reads_ticks_even_when_daily_uses_candles(tmp_path, monkeypatch):
-    """DUKASCOPY_BAR_SOURCE=candles is for the daily runs; the hourly DAG must still work."""
+def _tasks(tmp_path, monkeypatch, **overrides):
     import sys
-    from datetime import datetime, timezone
     from pathlib import Path
 
     from ingestion.dukascopy import pipeline
@@ -286,20 +284,71 @@ def test_hourly_task_reads_ticks_even_when_daily_uses_candles(tmp_path, monkeypa
     import dlh_tasks
 
     settings = Settings(local_data_dir=str(tmp_path / "data"), symbols=["EURUSD"], datasets=["bars"],
-                        bar_source="candles", bar_timeframes=["1min", "1h"])
+                        bar_source="candles", bar_timeframes=["1min", "1h"], **overrides)
     cloud = Cloud(CloudSettings(env="local", local_dir=str(tmp_path / ".local_gcp")))
     setup(settings, cloud)
     monkeypatch.setattr(dlh_tasks, "_pipeline", lambda: (pipeline, settings, cloud))
     fetched = []
 
     def fetch(self, symbol, hour):
-        fetched.append(hour.hour)
+        fetched.append(hour)
         return lzma.compress(np.array([(0, 117012, 117010, 1.0, 1.0)], dtype=TICK_DTYPE).tobytes(),
                              format=lzma.FORMAT_ALONE)
 
     monkeypatch.setattr(DukascopyClient, "fetch_hour_raw", fetch)
+    return dlh_tasks, settings, cloud, fetched
+
+
+def test_intraday_task_reads_ticks_even_when_cli_uses_candles(tmp_path, monkeypatch):
+    """DUKASCOPY_BAR_SOURCE=candles is for the CLI; the DAGs always build from ticks."""
+    from datetime import datetime, timezone
+
+    dlh_tasks, settings, cloud, fetched = _tasks(tmp_path, monkeypatch)
     # a Thursday; 03:00 just closed
-    result = dlh_tasks.hourly(data_interval_end=datetime(2026, 10, 29, 3, 10, tzinfo=timezone.utc))
-    assert result["EURUSD"].startswith("loaded") and sorted(fetched) == [0, 1, 2]
+    result = dlh_tasks.intraday(data_interval_end=datetime(2026, 10, 29, 3, 10, tzinfo=timezone.utc))
+    assert result["EURUSD"].startswith("loaded") and sorted(h.hour for h in fetched) == [0, 1, 2]
     assert len(cloud.bq.query("SELECT ts FROM market_1h.dukascopy_bars")) == 3
-    assert settings.bar_source == "candles"  # the daily runs' settings are untouched
+    assert settings.bar_source == "candles"  # the CLI's settings are untouched
+
+
+def test_finalize_publishes_yesterday_once_from_cached_hours(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+
+    from ingestion.dukascopy.pipeline import lake_uri
+
+    dlh_tasks, settings, cloud, fetched = _tasks(tmp_path, monkeypatch)
+    dlh_tasks.intraday(data_interval_end=datetime(2026, 10, 29, 23, 10, tzinfo=timezone.utc))
+    assert len(fetched) == 23  # 00h..22h cached, provisional rows in BigQuery
+    fetched.clear()
+
+    midnight = datetime(2026, 10, 30, 0, 10, tzinfo=timezone.utc)
+    result = dlh_tasks.finalize(data_interval_end=midnight)
+    assert result == {"date": "2026-10-29", "published": ["EURUSD"], "existing": 0}
+    assert [h.hour for h in fetched] == [23]  # only the hour not cached yet
+    assert cloud.storage.exists(lake_uri(settings, "bars_1h", "EURUSD", date(2026, 10, 29)))
+    assert dlh_tasks.load()["loaded"] == 2  # bars_1min + bars_1h
+    assert len(cloud.bq.query("SELECT ts FROM market_1h.dukascopy_bars")) == 24
+
+    assert dlh_tasks.intraday(data_interval_end=midnight)["EURUSD"].startswith("complete")
+    fetched.clear()
+    result = dlh_tasks.finalize(data_interval_end=datetime(2026, 10, 30, 1, 10, tzinfo=timezone.utc))
+    assert (result["published"], result["existing"], fetched) == ([], 1, [])
+    assert dlh_tasks.load()["loaded"] == 0
+
+
+def test_finalize_fails_on_incomplete_day_and_skips_saturday(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+
+    dlh_tasks, settings, cloud, fetched = _tasks(tmp_path, monkeypatch)
+
+    def fetch(self, symbol, hour):
+        raise DukascopyError("HTTP 429")
+
+    monkeypatch.setattr(DukascopyClient, "fetch_hour_raw", fetch)
+    with pytest.raises(RuntimeError, match="2026-10-29 incomplete"):
+        dlh_tasks.finalize(data_interval_end=datetime(2026, 10, 30, 0, 10, tzinfo=timezone.utc))
+    from ingestion.dukascopy.pipeline import lake_uri
+    assert not cloud.storage.exists(lake_uri(settings, "bars_1h", "EURUSD", date(2026, 10, 29)))
+
+    result = dlh_tasks.finalize(data_interval_end=datetime(2026, 11, 1, 5, 10, tzinfo=timezone.utc))
+    assert result == {"date": "2026-10-31", "skipped": "saturday"}

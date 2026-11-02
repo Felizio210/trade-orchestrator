@@ -48,11 +48,14 @@ source airflow/env.sh                          # required before any other `airf
   broker sync → signals → risk → orders), `brokers/` (`base.py` interface, `paper.py` with the
   engine's fill rules), `risk.py`, `store.py` (records + keyed reads/writes), `tables.py`.
   Design notes in `docs/trading_plan.md`.
-- `airflow/dags/` — `dukascopy_daily` (02:00 UTC), `dukascopy_repair` (09:00 UTC gap fill),
-  `dukascopy_setup` (manual), `backtest_daily` (triggered by the `dlh://market/bars` Dataset, which only `dukascopy_repair` emits,
-  once the repair window has no gaps), `trading_gate` (on `dlh://backtest/metrics` from `backtest_daily`),
-  `dukascopy_hourly` (hourly at :10, provisional bars for today) and `trading_live` (on
-  `dlh://market/bars/hourly` from `dukascopy_hourly`).
+- `airflow/dags/` — `dukascopy_hourly` (hourly at :10, the only scheduled download:
+  `finalize` publishes yesterday to the lake once it's complete, `load` drains it into
+  BigQuery, `intraday` loads today's closed hours as provisional bars), `dukascopy_repair`
+  (09:00 UTC gap fill over the last days), `dukascopy_setup` (manual), `backtest_daily`
+  (triggered by the `dlh://market/bars` Dataset, which only `dukascopy_repair` emits, once the
+  repair window has no gaps), `trading_gate` (on `dlh://backtest/metrics` from `backtest_daily`)
+  and `trading_live` (on `dlh://market/bars/hourly` from `dukascopy_hourly`). The DAGs always
+  build from ticks; `DUKASCOPY_BAR_SOURCE=candles` only affects the CLI.
   DAG files stay thin: all logic lives in `airflow/plugins/dlh_tasks.py`, which imports
   heavy modules inside functions so the scheduler parses DAGs cheaply.
 
@@ -75,7 +78,7 @@ source airflow/env.sh                          # required before any other `airf
 - **Dukascopy rate limits**: keep `DUKASCOPY_MAX_WORKERS` low; the client backs off on 429.
   Saturdays (UTC) are skipped. Incomplete days are never published to the lake; the only
   partial data is `load_intraday`, which writes today's closed bars straight to BigQuery
-  until the daily run replaces them.
+  until the next day's `finalize` replaces them.
 - **Strategies**: a function `bars -> signals` (`signal` ±1/0, `stop`, `target`); a signal on
   bar t may only use data up to t's close (no lookahead); the engine enters at t+1's open.
   The paper broker must keep the engine's fill rules: `test_paper_trades_match_the_backtest_engine`

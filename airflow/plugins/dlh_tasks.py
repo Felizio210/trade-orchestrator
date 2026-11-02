@@ -25,6 +25,16 @@ def _pipeline():
     return pipeline, Settings.from_env(), Cloud.from_env()
 
 
+def _ticks(settings):
+    """The scheduled DAGs always build from tick files, whatever DUKASCOPY_BAR_SOURCE says:
+    candle files only exist per day, and the hourly runs have already cached the tick hours,
+    so finalize and repair reuse them instead of downloading the day a second time.
+    DUKASCOPY_BAR_SOURCE=candles still applies to the CLI (e.g. long manual backfills)."""
+    from dataclasses import replace
+
+    return replace(settings, bar_source="ticks")
+
+
 def is_trading_day(ds: str, **_) -> bool:
     """False on Saturdays (UTC): nothing trades, and the empty hours are never cached."""
     return date.fromisoformat(ds).weekday() != 5
@@ -35,18 +45,28 @@ def setup(**_) -> list[str]:
     return pipeline.setup(settings, cloud)
 
 
-def download_publish(ds: str, **_) -> dict:
-    """Download one UTC day for every symbol and publish it. Safe to retry.
+def finalize(data_interval_end, **_) -> dict:
+    """Publish the last complete UTC day (yesterday) to the lake and Pub/Sub, once.
 
-    Symbols already in the lake are skipped, so a retry only redoes what failed.
-    Incomplete days are not published; the task fails at the end so Airflow retries.
+    Runs at the start of every dukascopy_hourly run. At 00:10 yesterday has just closed and
+    gets published from the tick hours already on disk (only missing hours are fetched);
+    the `load` task then replaces yesterday's provisional rows with the complete day. Later
+    runs find it in the lake and only do a few lookups. Saturdays are skipped.
+
+    Incomplete days are not published and the task fails, without retries: the next hourly
+    run tries again, and dukascopy_repair covers anything older.
     """
+    from datetime import timedelta
+
     pipeline, settings, cloud = _pipeline()
+    settings = _ticks(settings)
     from ingestion.dukascopy.client import DukascopyClient
     from ingestion.dukascopy.downloader import download_day, problem_summary, problems
 
     settings.validate()
-    day = date.fromisoformat(ds)
+    day = data_interval_end.replace(minute=0, second=0, microsecond=0).date() - timedelta(days=1)
+    if day.weekday() == 5:
+        return {"date": day.isoformat(), "skipped": "saturday"}
     datasets = pipeline._dataset_names(settings)
     client = DukascopyClient(settings)
     published, existing, incomplete = [], 0, []
@@ -61,8 +81,8 @@ def download_publish(ds: str, **_) -> dict:
         pipeline.publish_day(symbol, day, settings, cloud)
         published.append(symbol)
     if incomplete:
-        raise RuntimeError(f"{ds} incomplete, will retry: " + "; ".join(incomplete))
-    return {"published": published, "existing": existing}
+        raise RuntimeError(f"{day} incomplete, next hourly run retries: " + "; ".join(incomplete))
+    return {"date": day.isoformat(), "published": published, "existing": existing}
 
 
 def load(**_) -> dict:
@@ -77,13 +97,15 @@ def load(**_) -> dict:
 def repair(ds: str, **_) -> dict:
     """Backfill any day missing from the last DUKASCOPY_REPAIR_DAYS days up to `ds`.
 
-    Covers days dukascopy_daily never ran (catchup=False skips downtime) and days whose
-    run failed. Days already in the lake are skipped, so a quiet day costs a few lookups.
-    Days still incomplete fail the task at the end so Airflow retries them.
+    Covers days finalize never published: the scheduler was down (catchup=False skips
+    downtime) or Dukascopy stayed incomplete. Days already in the lake are skipped, so a
+    quiet day costs a few lookups. Days still incomplete fail the task at the end so
+    Airflow retries them.
     """
     from datetime import timedelta
 
     pipeline, settings, cloud = _pipeline()
+    settings = _ticks(settings)
     end = date.fromisoformat(ds)
     start = end - timedelta(days=int(os.environ.get("DUKASCOPY_REPAIR_DAYS", "7")) - 1)
     result = pipeline.backfill_range(settings.symbols, start, end, settings, cloud)
@@ -106,21 +128,17 @@ def _market_open(hour) -> bool:
                 or hour.hour == 21)
 
 
-def hourly(data_interval_end, **_) -> dict:
-    """Load the closed hours of the current UTC day for every symbol, ahead of the daily run.
+def intraday(data_interval_end, **_) -> dict:
+    """Load the closed hours of the current UTC day for every symbol, as provisional rows.
 
     Fails (so Airflow retries) when an hour failed to download, or when the hour that just
     closed is still empty while the market should be open: Dukascopy publishes each hour a
-    few minutes after it ends.
-
-    Always reads ticks, whatever DUKASCOPY_BAR_SOURCE says: candle files only exist per day.
-    The daily runs keep their own source, and replace these provisional rows next morning.
+    few minutes after it ends. Next day's finalize replaces these rows with the complete day.
     """
-    from dataclasses import replace
     from datetime import timedelta
 
     pipeline, settings, cloud = _pipeline()
-    settings = replace(settings, bar_source="ticks")
+    settings = _ticks(settings)
     from ingestion.dukascopy.client import DukascopyClient
 
     client = DukascopyClient(settings)

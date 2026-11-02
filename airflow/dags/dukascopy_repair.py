@@ -1,8 +1,9 @@
 """Daily gap repair: backfills any of the last DUKASCOPY_REPAIR_DAYS days missing from the lake.
 
-dukascopy_daily has catchup=False, so days the scheduler was down are never run, and a run
-that fails all its retries stays failed. This catches both. Logic lives in plugins/dlh_tasks.py.
-Large historical backfills stay manual: `python -m ingestion.dukascopy backfill`.
+dukascopy_hourly's finalize only publishes yesterday, and catchup=False skips the hours the
+scheduler was down, so a day still incomplete after midnight or missed by downtime would stay
+out of the lake. This catches both, reusing the tick hours already on disk.
+Logic lives in plugins/dlh_tasks.py. Large historical backfills stay manual: `python -m ingestion.dukascopy backfill`.
 
 It is also what triggers backtest_daily: once the window has no gaps left, so backtests never
 run over missing days.
@@ -19,7 +20,7 @@ from airflow.operators.python import PythonOperator, ShortCircuitOperator
 
 with DAG(
     dag_id="dukascopy_repair",
-    # Well after dukascopy_daily (02:00 + up to 4 attempts) so the two don't hit Dukascopy together
+    # Late enough that finalize has had several hourly attempts at yesterday
     schedule="0 9 * * *",
     start_date=pendulum.datetime(2026, 10, 30, tz="UTC"),
     catchup=False,  # each run already looks back over several days

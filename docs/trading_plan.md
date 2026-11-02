@@ -15,14 +15,17 @@ exit) on record so a step can be retried or audited. Same code for `DLH_ENV=loca
 
 ```
                           (daily)                          (hourly)
-dukascopy_daily 02:00 ─┐                     dukascopy_hourly :10
-dukascopy_repair 09:00 ┴─> backtest_daily      today's closed hours -> market_*.dukascopy_bars
-                             │ backtest.metrics          │
-                             v                           v
-                         trading_gate              trading_live
-                    metrics vs standards       new bars -> signals of approved
-                    -> trading.approvals       strategies -> risk -> orders -> broker
-                                                         │
+dukascopy_repair 09:00 ──> backtest_daily      dukascopy_hourly :10
+  last 7 days gap-free       │ backtest.metrics  finalize: yesterday -> lake -> Pub/Sub
+                             v                   load:     Pub/Sub -> market_* (final)
+                         trading_gate            intraday: today's closed hours
+                    metrics vs standards                   -> market_* (provisional)
+                    -> trading.approvals                   │
+                                                           v
+                                                     trading_live
+                                               new bars -> signals of approved
+                                               strategies -> risk -> orders -> broker
+                                                           │
                                        trading.signals / orders / positions / account / events
 ```
 
@@ -66,11 +69,18 @@ hour, `dukascopy_hourly`:
 2. Builds bars from them and keeps only bars that have **fully closed** (a 4h bar still
    forming is left out).
 3. Writes them straight to `market_*.dukascopy_bars`, replacing that symbol/day. They skip
-   the lake and Pub/Sub: they're **provisional**. At 02:00, `dukascopy_daily` publishes the
-   complete day, which replaces them. A day already in the lake is never touched.
+   the lake and Pub/Sub: they're **provisional**. A day already in the lake is never touched.
 4. If an hour failed, or the hour that just closed is still empty while the market should
    be open, the task fails and Airflow retries 10 minutes later (up to 3 times). Weekends and
    the daily 21:00 UTC rollover are treated as closed.
+
+Before that, the run's `finalize` task publishes **yesterday** to the lake and Pub/Sub if it
+isn't there yet, from the tick hours already on disk (only missing hours are fetched), and
+`load` drains it into BigQuery, replacing yesterday's provisional rows with the complete day.
+That normally happens at 00:10; later runs only check the lake. `finalize` has no retries
+(the next hourly run is the retry) and `intraday` runs whatever it did, so a late day never
+holds up trading. `dukascopy_repair` at 09:00 fills anything older. There is no separate daily
+download: every scheduled DAG builds from ticks, whatever `DUKASCOPY_BAR_SOURCE` says.
 
 Backtests are unaffected: they only read up to yesterday. The "incomplete days are never
 published" rule still holds for the lake.
@@ -242,7 +252,7 @@ In Airflow, unpause `dukascopy_hourly`, `trading_gate` and `trading_live`.
   strategies results differ from per-symbol backtests (each of which starts from its own
   capital). With one strategy on one symbol they match exactly (tested).
 - **Late intraday hours:** if hour H arrives after hour H+1 was already traded, the live step
-  never sees H (its cursor has passed it). The daily run still loads it for backtests.
+  never sees H (its cursor has passed it). `finalize` still publishes it for backtests.
 
 ## Step 2: Dukascopy demo account
 

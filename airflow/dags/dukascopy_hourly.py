@@ -1,9 +1,13 @@
-"""Hourly: loads the closed hours of the current UTC day into the bars tables, so trading sees
-each new bar within the hour. Logic lives in plugins/dlh_tasks.py.
+"""Hourly Dukascopy load: the only scheduled download of market data. Logic lives in
+plugins/dlh_tasks.py.
 
-The rows are provisional: they go straight into BigQuery (no lake, no Pub/Sub), and the
-02:00 dukascopy_daily run replaces them with the complete day. Emits the hourly bars
-Dataset, which triggers trading_live.
+finalize publishes yesterday's complete day to the lake and Pub/Sub (once, at 00:10, from
+the tick hours already on disk) and load drains it into BigQuery. intraday loads the closed
+hours of today straight into the bars tables as provisional rows, which tomorrow's finalize
+replaces. dukascopy_repair (09:00) fills anything finalize missed.
+
+intraday runs whatever finalize did, so trading never waits on yesterday; a failed finalize
+or load still marks the run failed. Emits the hourly bars Dataset, which triggers trading_live.
 """
 
 from datetime import timedelta
@@ -14,6 +18,7 @@ from airflow import DAG
 from airflow.datasets import Dataset
 from airflow.operators.empty import EmptyOperator
 from airflow.operators.python import PythonOperator
+from airflow.utils.trigger_rule import TriggerRule
 
 with DAG(
     dag_id="dukascopy_hourly",
@@ -21,11 +26,17 @@ with DAG(
     schedule="10 * * * *",
     start_date=pendulum.datetime(2026, 10, 30, tz="UTC"),
     catchup=False,  # each run picks up every closed hour of the day anyway
-    max_active_runs=1,
+    max_active_runs=1,  # one Dukascopy client at a time (rate limits), one writer
     default_args={"retries": 3, "retry_delay": timedelta(minutes=10), "execution_timeout": timedelta(minutes=20)},
     tags=["dukascopy", "trading"],
 ) as dag:
-    hourly = PythonOperator(task_id="hourly", python_callable=dlh_tasks.hourly)
+    # No retries: they would hold up intraday; the next hourly run is the retry
+    finalize = PythonOperator(task_id="finalize", python_callable=dlh_tasks.finalize, retries=0)
+    load = PythonOperator(task_id="load", python_callable=dlh_tasks.load)
+    # After finalize, so at 00:10 it finds yesterday already in the lake and leaves it alone
+    intraday = PythonOperator(task_id="intraday", python_callable=dlh_tasks.intraday,
+                              trigger_rule=TriggerRule.ALL_DONE)
     notify = EmptyOperator(task_id="notify", outlets=[Dataset(dlh_tasks.HOURLY_BARS)])
 
-    hourly >> notify
+    finalize >> [load, intraday]
+    intraday >> notify
