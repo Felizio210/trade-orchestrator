@@ -2,6 +2,7 @@
 
 One task per (strategy, timeframe); results land in the backtest dataset under
 run_id daily-{strategy}-{timeframe}-{ds}. Logic lives in plugins/dlh_tasks.py.
+Once every backtest succeeded it emits the backtest results Dataset, which triggers trading_gate.
 """
 
 from datetime import timedelta
@@ -10,6 +11,7 @@ import dlh_tasks
 import pendulum
 from airflow import DAG
 from airflow.datasets import Dataset
+from airflow.operators.empty import EmptyOperator
 from airflow.operators.python import PythonOperator
 
 with DAG(
@@ -22,9 +24,10 @@ with DAG(
     tags=["backtest"],
 ) as dag:
     setup = PythonOperator(task_id="setup", python_callable=dlh_tasks.backtest_setup)
+    notify = EmptyOperator(task_id="notify", outlets=[Dataset(dlh_tasks.BACKTEST_RESULTS)])
     for strategy, timeframe in dlh_tasks.backtest_jobs():
         setup >> PythonOperator(
             task_id=f"{strategy}_{timeframe}",
             python_callable=dlh_tasks.backtest,
             op_kwargs={"strategy": strategy, "timeframe": timeframe},
-        )
+        ) >> notify

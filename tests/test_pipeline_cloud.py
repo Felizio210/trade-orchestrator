@@ -272,3 +272,34 @@ def test_repair_task_fills_gaps_and_retries_incomplete(tmp_path, monkeypatch):
 
     result = dlh_tasks.repair(ds="2026-09-06")
     assert (result["existing"], result["published"], result["loaded"]) == (2, [], 0)
+
+
+def test_hourly_task_reads_ticks_even_when_daily_uses_candles(tmp_path, monkeypatch):
+    """DUKASCOPY_BAR_SOURCE=candles is for the daily runs; the hourly DAG must still work."""
+    import sys
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    from ingestion.dukascopy import pipeline
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "airflow" / "plugins"))
+    import dlh_tasks
+
+    settings = Settings(local_data_dir=str(tmp_path / "data"), symbols=["EURUSD"], datasets=["bars"],
+                        bar_source="candles", bar_timeframes=["1min", "1h"])
+    cloud = Cloud(CloudSettings(env="local", local_dir=str(tmp_path / ".local_gcp")))
+    setup(settings, cloud)
+    monkeypatch.setattr(dlh_tasks, "_pipeline", lambda: (pipeline, settings, cloud))
+    fetched = []
+
+    def fetch(self, symbol, hour):
+        fetched.append(hour.hour)
+        return lzma.compress(np.array([(0, 117012, 117010, 1.0, 1.0)], dtype=TICK_DTYPE).tobytes(),
+                             format=lzma.FORMAT_ALONE)
+
+    monkeypatch.setattr(DukascopyClient, "fetch_hour_raw", fetch)
+    # a Thursday; 03:00 just closed
+    result = dlh_tasks.hourly(data_interval_end=datetime(2026, 10, 29, 3, 10, tzinfo=timezone.utc))
+    assert result["EURUSD"].startswith("loaded") and sorted(fetched) == [0, 1, 2]
+    assert len(cloud.bq.query("SELECT ts FROM market_1h.dukascopy_bars")) == 3
+    assert settings.bar_source == "candles"  # the daily runs' settings are untouched

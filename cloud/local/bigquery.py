@@ -164,6 +164,57 @@ class LocalBigQuery(Warehouse):
                 raise
         return len(rows)
 
+    def _keyed_rows(self, conn: sqlite3.Connection, df: pd.DataFrame, table_id: str,
+                    key: list[str]) -> tuple[list[Field], pd.DataFrame]:
+        schema = self._schema(conn, table_id)
+        unknown = set(key) - {f.name for f in schema}
+        if not key or unknown:
+            raise ValueError(f"key columns {sorted(unknown) or key} are not in {table_id}")
+        rows = _coerce(df, schema)
+        if rows.duplicated(subset=key).any():
+            raise ValueError(f"Duplicate {key} values in the rows for {table_id}")
+        return schema, rows
+
+    def upsert_from_dataframe(self, df: pd.DataFrame, table_id: str, key: list[str]) -> int:
+        dataset, table = split_table_id(table_id)
+        with closing(self._connect()) as conn:
+            schema, rows = self._keyed_rows(conn, df, table_id, key)
+            cols = ", ".join(f.name for f in schema)
+            marks = ", ".join("?" * len(schema))
+            where = " AND ".join(f"{k} = ?" for k in key)
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.executemany(f'DELETE FROM "{dataset}".{table} WHERE {where}',
+                                 rows[key].itertuples(index=False, name=None))
+                conn.executemany(f'INSERT INTO "{dataset}".{table} ({cols}) VALUES ({marks})',
+                                 rows.itertuples(index=False, name=None))
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        return len(rows)
+
+    def insert_if_absent(self, df: pd.DataFrame, table_id: str, key: list[str]) -> int:
+        dataset, table = split_table_id(table_id)
+        with closing(self._connect()) as conn:
+            schema, rows = self._keyed_rows(conn, df, table_id, key)
+            cols = ", ".join(f.name for f in schema)
+            marks = ", ".join("?" * len(schema))
+            where = " AND ".join(f"{k} = ?" for k in key)
+            sql = (f'INSERT INTO "{dataset}".{table} ({cols}) SELECT {marks} '
+                   f'WHERE NOT EXISTS (SELECT 1 FROM "{dataset}".{table} WHERE {where})')
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                before = conn.total_changes
+                conn.executemany(sql, ((*row, *(row[rows.columns.get_loc(k)] for k in key))
+                                       for row in rows.itertuples(index=False, name=None)))
+                inserted = conn.total_changes - before
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        return inserted
+
     def replace_from_uri(self, uri: str, table_id: str, match: dict[str, Any]) -> int:
         data = self.storage.download_bytes(uri)
         if uri.endswith(".parquet"):

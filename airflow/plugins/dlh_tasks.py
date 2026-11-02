@@ -98,9 +98,46 @@ def repair(ds: str, **_) -> dict:
     return summary
 
 
+def _market_open(hour) -> bool:
+    """Rough FX/metals hours: closed Friday 21:00 to Sunday 22:00 UTC, and the daily 21:00
+    rollover hour (gold has no ticks then). Only decides whether an empty hour is worth a retry."""
+    weekday = hour.weekday()
+    return not (weekday == 5 or (weekday == 4 and hour.hour >= 21) or (weekday == 6 and hour.hour < 22)
+                or hour.hour == 21)
+
+
+def hourly(data_interval_end, **_) -> dict:
+    """Load the closed hours of the current UTC day for every symbol, ahead of the daily run.
+
+    Fails (so Airflow retries) when an hour failed to download, or when the hour that just
+    closed is still empty while the market should be open: Dukascopy publishes each hour a
+    few minutes after it ends.
+
+    Always reads ticks, whatever DUKASCOPY_BAR_SOURCE says: candle files only exist per day.
+    The daily runs keep their own source, and replace these provisional rows next morning.
+    """
+    from dataclasses import replace
+    from datetime import timedelta
+
+    pipeline, settings, cloud = _pipeline()
+    settings = replace(settings, bar_source="ticks")
+    from ingestion.dukascopy.client import DukascopyClient
+
+    client = DukascopyClient(settings)
+    results = [pipeline.load_intraday(s, settings, cloud, now=data_interval_end, client=client)
+               for s in settings.symbols]
+    last_hour = data_interval_end.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
+    waiting = [r["symbol"] for r in results if r["last_hour"] == "empty" and _market_open(last_hour)]
+    if waiting:
+        raise RuntimeError(f"{last_hour:%Y-%m-%d %H}h not published yet for {waiting}, will retry")
+    return {r["symbol"]: f"{r['status']} {r['rows']} rows" for r in results}
+
+
 # --- backtest ---
 
 MARKET_BARS = "dlh://market/bars"  # Dataset URI: dukascopy_repair emits it, backtest_daily runs on it
+HOURLY_BARS = "dlh://market/bars/hourly"  # dukascopy_hourly emits it, trading_live runs on it
+BACKTEST_RESULTS = "dlh://backtest/metrics"  # backtest_daily emits it, trading_gate runs on it
 
 
 def backtest_jobs() -> list[tuple[str, str]]:
@@ -148,3 +185,41 @@ def backtest(strategy: str, timeframe: str, ds: str, **_) -> dict:
     return {"run_id": result["run_id"],
             "metrics": {m["symbol"]: {k: m[k] for k in ("n_trades", "total_return", "max_drawdown", "sharpe")}
                         for m in result["metrics"]}}
+
+
+# --- trading ---
+
+
+def _trading():
+    if str(PROJECT_DIR) not in sys.path:
+        sys.path.insert(0, str(PROJECT_DIR))
+    from backtest.config import BacktestSettings
+    from cloud import Cloud
+    from ingestion.dukascopy.config import Settings
+    from trading.config import TradingSettings
+
+    return TradingSettings.from_env(), BacktestSettings.from_env(), Settings.from_env(), Cloud.from_env()
+
+
+def trading_setup(**_) -> list[str]:
+    settings, _backtest, _market, cloud = _trading()  # puts the project on sys.path first
+    from trading.gate import setup as trading_tables
+
+    return trading_tables(settings, cloud)
+
+
+def trading_gate(**_) -> dict:
+    """Approve or reject each strategy/timeframe/symbol from its latest daily backtest."""
+    settings, backtest, _market, cloud = _trading()  # puts the project on sys.path first
+    from trading.gate import evaluate
+
+    return {f"{r['strategy']}:{r['timeframe']}:{r['symbol']}": r["status"] + (f" ({r['reasons']})" if r["reasons"] else "")
+            for r in evaluate(settings, backtest, cloud)}
+
+
+def trading_step(**_) -> dict:
+    """Trade every bar that closed since the last step. Safe to retry: ids are deterministic."""
+    settings, backtest, market, cloud = _trading()  # puts the project on sys.path first
+    from trading.executor import step
+
+    return step(settings, backtest, market, cloud)

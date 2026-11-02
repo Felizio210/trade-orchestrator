@@ -1,7 +1,8 @@
 # CLAUDE.md
 
-DLH: a market-data pipeline (Dukascopy → Cloud Storage → Pub/Sub → BigQuery) plus a backtester
-that runs trading strategies over the loaded bars. Everything runs either against a **local
+DLH: a market-data pipeline (Dukascopy → Cloud Storage → Pub/Sub → BigQuery), a backtester
+that runs trading strategies over the loaded bars, and a trading layer that trades the strategies
+whose backtest passes the standards (paper broker for now). Everything runs either against a **local
 emulation** of GCP or **real GCP**, with the same code.
 
 ## Environments
@@ -24,6 +25,7 @@ emulation** of GCP or **real GCP**, with the same code.
 
 python -m ingestion.dukascopy --help           # download | convert | check | setup | publish | load | run | backfill
 python -m backtest --help                      # setup | strategies | run | list
+python -m trading --help                       # setup | gate | step | status | kill | resume
 python -m cloud --help                         # status | gcs | pubsub | bq | reset (inspect either backend)
 
 airflow/start.sh                               # Airflow standalone, UI at http://localhost:8080
@@ -42,9 +44,15 @@ source airflow/env.sh                          # required before any other `airf
 - `backtest/` — `strategies/` (registry + `supply_demand`, `trendline`), `engine.py`
   (simulation), `metrics.py`, `runner.py` (load → signals → simulate → metrics → write),
   `tables.py`. Design notes in `docs/backtest_plan.md`.
+- `trading/` — `gate.py` (backtest metrics → approvals), `executor.py` (one step: new bars →
+  broker sync → signals → risk → orders), `brokers/` (`base.py` interface, `paper.py` with the
+  engine's fill rules), `risk.py`, `store.py` (records + keyed reads/writes), `tables.py`.
+  Design notes in `docs/trading_plan.md`.
 - `airflow/dags/` — `dukascopy_daily` (02:00 UTC), `dukascopy_repair` (09:00 UTC gap fill),
   `dukascopy_setup` (manual), `backtest_daily` (triggered by the `dlh://market/bars` Dataset, which only `dukascopy_repair` emits,
-  once the repair window has no gaps).
+  once the repair window has no gaps), `trading_gate` (on `dlh://backtest/metrics` from `backtest_daily`),
+  `dukascopy_hourly` (hourly at :10, provisional bars for today) and `trading_live` (on
+  `dlh://market/bars/hourly` from `dukascopy_hourly`).
   DAG files stay thin: all logic lives in `airflow/plugins/dlh_tasks.py`, which imports
   heavy modules inside functions so the scheduler parses DAGs cheaply.
 
@@ -58,13 +66,20 @@ source airflow/env.sh                          # required before any other `airf
   `QUALIFY`, …) fail locally. Locally, TIMESTAMP/DATE come back as strings.
 - **Idempotent writes**: loads and backtest results replace by key
   (`replace_from_dataframe(df, table, match={...})` — symbol/day for market data, `run_id`
-  for backtests) so retries and re-runs never duplicate rows.
+  for backtests) so retries and re-runs never duplicate rows. Trading state tables use
+  `upsert_from_dataframe` / `insert_if_absent` by key, with deterministic ids
+  (`{strategy}:{timeframe}:{symbol}:{bar_ts}`): an order is only placed if its signal row was
+  actually inserted. On BigQuery that relies on one writer (`max_active_runs=1`).
 - **Datasets**: ticks in `market.dukascopy_ticks`; bars in one dataset per timeframe
   (`market_1min.dukascopy_bars`, `market_1h.…`); backtest output in `backtest.runs/trades/equity/metrics`.
 - **Dukascopy rate limits**: keep `DUKASCOPY_MAX_WORKERS` low; the client backs off on 429.
-  Saturdays (UTC) are skipped. Incomplete days are never published.
+  Saturdays (UTC) are skipped. Incomplete days are never published to the lake; the only
+  partial data is `load_intraday`, which writes today's closed bars straight to BigQuery
+  until the daily run replaces them.
 - **Strategies**: a function `bars -> signals` (`signal` ±1/0, `stop`, `target`); a signal on
   bar t may only use data up to t's close (no lookahead); the engine enters at t+1's open.
+  The paper broker must keep the engine's fill rules: `test_paper_trades_match_the_backtest_engine`
+  checks they produce the same trades.
 - Tests use `tmp_path` and fake Dukascopy clients; they must not hit the network or GCP.
 - Never commit `.env`, `data/`, `.local_gcp/`, `.airflow/` or service-account JSON (all gitignored).
 - Commits and PRs: no Claude attribution lines (no `Co-Authored-By: Claude`, no "Generated with Claude Code").

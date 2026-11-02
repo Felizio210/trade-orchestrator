@@ -148,6 +148,18 @@ class Warehouse(ABC):
         """Same as replace_from_uri, from an in-memory DataFrame."""
 
     @abstractmethod
+    def upsert_from_dataframe(self, df: pd.DataFrame, table_id: str, key: list[str]) -> int:
+        """Write each row of df, replacing any existing row with the same `key` columns, in
+        one transaction. For small state tables (orders, positions); returns rows written."""
+
+    @abstractmethod
+    def insert_if_absent(self, df: pd.DataFrame, table_id: str, key: list[str]) -> int:
+        """Insert only the rows whose `key` isn't in the table yet, in one statement.
+        Returns how many were inserted, so 0 means "already there" (e.g. an order that was
+        already placed). Concurrent callers are only safe locally; on BigQuery, keep a
+        single writer per table (Airflow max_active_runs=1)."""
+
+    @abstractmethod
     def query(self, sql: str, params: dict[str, Any] | None = None) -> pd.DataFrame:
         """Run SQL with @name parameters. Locally this is SQLite, so stick to portable SQL."""
 

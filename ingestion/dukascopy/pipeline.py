@@ -123,29 +123,10 @@ def publish_day(
                 cloud.storage.upload_file(f"{raw_prefix}/{f.name}", str(f))
         summary["raw_prefix"] = raw_prefix
 
-    ingested_at = datetime.now(timezone.utc)
-    frames: dict[str, pd.DataFrame] = {}
-    if settings.bar_source == "candles":
-        bars = _read_candle_bars(symbol, day, settings)
-        if bars.empty:
-            log.info("%s %s: no candles with volume (market closed), nothing to publish", symbol, day)
-            return summary
-    else:
-        ticks = read_day_dir(day_dir, settings.point_overrides)
-        if ticks.empty:
-            log.info("%s %s: no ticks (market closed), nothing to publish", symbol, day)
-            return summary
-        if "ticks" in settings.datasets:
-            frames["ticks"] = shape(ticks, "ticks", symbol, day, ingested_at)
-        bars = None
-    if "bars" in settings.datasets:
-        base = bars if bars is not None else ticks_to_bars(ticks, "1min", settings.bar_price_side)
-        for tf in settings.bar_timeframes:
-            # Coarser bars are built from the 1min bars for candles, straight from ticks otherwise
-            tf_bars = resample_bars(base, tf) if bars is not None else ticks_to_bars(ticks, tf, settings.bar_price_side)
-            frames[dataset_name("bars", tf)] = shape(
-                tf_bars, "bars", symbol, day, ingested_at, timeframe=tf, price_side=settings.bar_price_side,
-            )
+    frames = _day_frames(symbol, day, settings, datetime.now(timezone.utc))
+    if not frames:
+        log.info("%s %s: no data (market closed), nothing to publish", symbol, day)
+        return summary
 
     for dataset, df in frames.items():
         uri = lake_uri(settings, dataset, symbol, day)
@@ -162,6 +143,84 @@ def publish_day(
         summary["published"].append({**message, "message_id": message_id})
     log.info("%s %s: published %s", symbol, day, [p["dataset"] for p in summary["published"]])
     return summary
+
+
+def load_intraday(
+    symbol: str,
+    settings: Settings,
+    cloud: Cloud,
+    *,
+    now: datetime | None = None,
+    client: DukascopyClient | None = None,
+) -> dict:
+    """Load the closed hours of the current UTC day straight into the bars tables, so
+    trading sees new bars within the hour instead of the next morning.
+
+    Works on the day of the last closed hour (at 00:10 that's still yesterday, so its last
+    hour isn't missed). Rows replace that symbol/day like a normal load, and the daily run
+    later replaces them with the complete day; a day already in the lake is left alone.
+    Only bars that have fully closed are written, and the lake and Pub/Sub are skipped:
+    these rows are provisional. Needs DUKASCOPY_BAR_SOURCE=ticks (candles come per day).
+
+    Returns {"symbol", "date", "until", "status": loaded | complete | closed,
+    "last_hour": ok | empty, "rows"}. Raises IncompleteDayError if an hour failed.
+    """
+    settings.validate()
+    if settings.bar_source != "ticks":
+        raise ValueError("The intraday load needs DUKASCOPY_BAR_SOURCE=ticks (candle files only exist per day).")
+    if "bars" not in settings.datasets:
+        raise ValueError("The intraday load writes bars; add bars to DUKASCOPY_DATASETS.")
+    symbol = symbol.upper()
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    until = now.replace(minute=0, second=0, microsecond=0)  # end of the last closed hour
+    day = (until - timedelta(hours=1)).date()
+    bar_datasets = [dataset_name("bars", tf) for tf in settings.bar_timeframes]
+    summary = {"symbol": symbol, "date": day.isoformat(), "until": until.isoformat(), "rows": 0}
+    if all(cloud.storage.exists(lake_uri(settings, d, symbol, day)) for d in bar_datasets):
+        return {**summary, "status": "complete", "last_hour": "ok"}
+
+    manifest = download_day(symbol, day, settings, client=client, until=until)
+    if problems(manifest):
+        raise IncompleteDayError(f"{symbol} {day} has {problem_summary(manifest)}; will retry")
+    summary["last_hour"] = manifest["hours"][-1]["status"]
+    frames = _day_frames(symbol, day, settings, datetime.now(timezone.utc))
+    if not frames:
+        return {**summary, "status": "closed"}
+    for tf in settings.bar_timeframes:
+        dataset = dataset_name("bars", tf)
+        df = frames[dataset]
+        df = df[pd.to_datetime(df["ts"], utc=True) + pd.Timedelta(tf) <= until]
+        summary["rows"] += cloud.bq.replace_from_dataframe(
+            df, bq_table_id(settings.bq_dataset, dataset), {"symbol": symbol, "date": day})
+    log.info("%s %s: intraday bars up to %s (%d rows)", symbol, day, until, summary["rows"])
+    return {**summary, "status": "loaded"}
+
+
+def _day_frames(symbol: str, day: date, settings: Settings, ingested_at: datetime) -> dict[str, pd.DataFrame]:
+    """dataset -> rows shaped for its table, from the files downloaded for one day.
+    Empty when the market was closed."""
+    day_dir = raw_day_dir(settings.raw_dir, symbol, day)
+    frames: dict[str, pd.DataFrame] = {}
+    if settings.bar_source == "candles":
+        bars = _read_candle_bars(symbol, day, settings)
+        if bars.empty:
+            return frames
+    else:
+        ticks = read_day_dir(day_dir, settings.point_overrides)
+        if ticks.empty:
+            return frames
+        if "ticks" in settings.datasets:
+            frames["ticks"] = shape(ticks, "ticks", symbol, day, ingested_at)
+        bars = None
+    if "bars" in settings.datasets:
+        base = bars if bars is not None else ticks_to_bars(ticks, "1min", settings.bar_price_side)
+        for tf in settings.bar_timeframes:
+            # Coarser bars are built from the 1min bars for candles, straight from ticks otherwise
+            tf_bars = resample_bars(base, tf) if bars is not None else ticks_to_bars(ticks, tf, settings.bar_price_side)
+            frames[dataset_name("bars", tf)] = shape(
+                tf_bars, "bars", symbol, day, ingested_at, timeframe=tf, price_side=settings.bar_price_side,
+            )
+    return frames
 
 
 def _read_candle_bars(symbol: str, day: date, settings: Settings) -> pd.DataFrame:

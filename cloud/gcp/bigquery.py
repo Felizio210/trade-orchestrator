@@ -134,6 +134,52 @@ class BigQueryWarehouse(Warehouse):
         self.client.load_table_from_dataframe(df[cols], staging, job_config=config).result()
         return self._swap_in(staging, target, match)
 
+    def _stage_keyed(self, df: pd.DataFrame, table_id: str, key: list[str]) -> tuple[bigquery.Table, str]:
+        target = self._target(table_id)
+        unknown = set(key) - {f.name for f in target.schema}
+        if not key or unknown:
+            raise ValueError(f"key columns {sorted(unknown) or key} are not in {table_id}")
+        if df.duplicated(subset=key).any():
+            raise ValueError(f"Duplicate {key} values in the rows for {table_id}")
+        staging = self._staging_ref(table_id)
+        config = bigquery.LoadJobConfig(
+            schema=target.schema, write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE
+        )
+        cols = [f.name for f in target.schema if f.name in df.columns]
+        self.client.load_table_from_dataframe(df[cols], staging, job_config=config).result()
+        return target, staging
+
+    def upsert_from_dataframe(self, df: pd.DataFrame, table_id: str, key: list[str]) -> int:
+        target, staging = self._stage_keyed(df, table_id, key)
+        try:
+            ref = target.full_table_id.replace(":", ".")
+            cols = ", ".join(f"`{f.name}`" for f in target.schema)
+            on = " AND ".join(f"t.`{k}` = s.`{k}`" for k in key)
+            self.client.query(f"""
+                BEGIN TRANSACTION;
+                DELETE FROM `{ref}` t WHERE EXISTS (SELECT 1 FROM `{staging}` s WHERE {on});
+                INSERT INTO `{ref}` ({cols}) SELECT {cols} FROM `{staging}`;
+                COMMIT TRANSACTION;
+            """).result()
+            return len(df)
+        finally:
+            self.client.delete_table(staging, not_found_ok=True)
+
+    def insert_if_absent(self, df: pd.DataFrame, table_id: str, key: list[str]) -> int:
+        target, staging = self._stage_keyed(df, table_id, key)
+        try:
+            ref = target.full_table_id.replace(":", ".")
+            cols = ", ".join(f"`{f.name}`" for f in target.schema)
+            on = " AND ".join(f"t.`{k}` = s.`{k}`" for k in key)
+            job = self.client.query(
+                f"MERGE `{ref}` t USING `{staging}` s ON {on} "
+                f"WHEN NOT MATCHED THEN INSERT ({cols}) VALUES ({cols})"
+            )
+            job.result()
+            return int(job.num_dml_affected_rows or 0)
+        finally:
+            self.client.delete_table(staging, not_found_ok=True)
+
     def query(self, sql: str, params: dict[str, Any] | None = None) -> pd.DataFrame:
         config = bigquery.QueryJobConfig(
             query_parameters=[query_parameter(k, v) for k, v in (params or {}).items()]

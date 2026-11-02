@@ -54,12 +54,16 @@ def download_day(
     *,
     overwrite: bool = False,
     client: DukascopyClient | None = None,
+    until: datetime | None = None,
 ) -> dict:
     """Download and verify the 24 hourly files for one UTC day. Returns the manifest.
 
     Hours that fail to download or decode are recorded in the manifest as "failed" /
     "corrupt" rather than raising, so one bad hour doesn't lose the rest of the day.
     Use problems(manifest) to check; re-running only re-fetches what's missing.
+
+    until: only the hours starting before it (the intraday load passes the end of the last
+    closed hour); the manifest then lists just those hours and records "until".
     """
     settings = settings or Settings.from_env()
     client = client or DukascopyClient(settings)
@@ -104,6 +108,8 @@ def download_day(
         }
 
     hours = [start + timedelta(hours=h) for h in range(24)]
+    if until is not None:
+        hours = [h for h in hours if h < until]
     with ThreadPoolExecutor(max_workers=settings.max_workers) as pool:
         entries = list(pool.map(one, hours))
 
@@ -112,6 +118,7 @@ def download_day(
         "date": day.isoformat(),
         "point_factor": factor,
         "downloaded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        **({"until": until.isoformat()} if until is not None else {}),
         "hours_ok": sum(e["status"] == "ok" for e in entries),
         "hours_empty": sum(e["status"] == "empty" for e in entries),
         "hours_corrupt": sum(e["status"] == "corrupt" for e in entries),
@@ -121,7 +128,8 @@ def download_day(
         "hours": entries,
     }
     (day_dir / "_manifest.json").write_text(json.dumps(manifest, indent=2))
-    log.info("%s %s: %d ticks, %d/24 hours with data", symbol, day, manifest["total_ticks"], manifest["hours_ok"])
+    log.info("%s %s: %d ticks, %d/%d hours with data", symbol, day, manifest["total_ticks"], manifest["hours_ok"],
+             len(hours))
 
     return manifest
 
