@@ -16,7 +16,7 @@ try:
 except ImportError:
     pass
 
-BROKERS = ("paper",)
+BROKERS = ("paper", "dukascopy")
 
 
 def _float(name: str, default: str) -> float | None:
@@ -30,6 +30,8 @@ class TradingSettings:
     dataset: str = "trading"
     broker: str = "paper"
     paper_capital: float = 10_000.0
+    # dlh-bridge (bridge/run.sh), for TRADING_BROKER=dukascopy
+    bridge_url: str = "http://127.0.0.1:8765"
     # Bars loaded before the new ones so indicators and zones are warmed up
     warmup_days: int = 60
     # Only daily backtests (run_id daily-...) can approve a strategy, not ad-hoc runs
@@ -58,6 +60,7 @@ class TradingSettings:
             dataset=env("TRADING_DATASET") or "trading",
             broker=(env("TRADING_BROKER") or "paper").lower(),
             paper_capital=float(env("TRADING_PAPER_CAPITAL", "10000")),
+            bridge_url=env("TRADING_BRIDGE_URL") or "http://127.0.0.1:8765",
             warmup_days=int(env("TRADING_WARMUP_DAYS", "60")),
             run_prefix=env("TRADING_RUN_PREFIX", "daily-"),
             approval_max_age_days=float(env("TRADING_APPROVAL_MAX_AGE_DAYS", "3")),

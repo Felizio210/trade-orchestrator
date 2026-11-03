@@ -35,3 +35,8 @@ class Broker(ABC):
     @abstractmethod
     def unrealized(self, position: Position, bar: pd.Series) -> float:
         """Open PnL of a position at the close of `bar`, on the side it would exit on."""
+
+    def balance(self) -> float | None:
+        """The account balance when the broker holds one; None means the executor computes it
+        from TRADING_PAPER_CAPITAL and the recorded positions."""
+        return None

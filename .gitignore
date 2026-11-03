@@ -12,3 +12,4 @@ data/
 *.sqlite
 *.db
 .DS_Store
+bridge/target/

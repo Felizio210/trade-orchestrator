@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- dlh-bridge: a local HTTP service that trades a Dukascopy account through the JForex SDK,
+     for trading/brokers/dukascopy.py. Build: mvn -q -f bridge/pom.xml package -->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>dlh</groupId>
+  <artifactId>dlh-bridge</artifactId>
+  <version>0.1.0</version>
+  <packaging>jar</packaging>
+
+  <properties>
+    <maven.compiler.release>17</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+  </properties>
+
+  <repositories>
+    <repository>
+      <id>dukascopy</id>
+      <url>https://www.dukascopy.com/client/jforexlib/publicrepo/</url>
+    </repository>
+  </repositories>
+
+  <dependencies>
+    <dependency>
+      <groupId>com.dukascopy.dds2</groupId>
+      <artifactId>DDS2-jClient-JForex</artifactId>
+      <version>3.6.51</version>
+    </dependency>
+    <dependency>
+      <groupId>com.dukascopy.api</groupId>
+      <artifactId>JForex-API</artifactId>
+      <version>2.13.99</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <!-- Copies the SDK jars to target/lib, so run.sh can start the bridge with a plain classpath -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-dependency-plugin</artifactId>
+        <version>3.6.1</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals><goal>copy-dependencies</goal></goals>
+            <configuration>
+              <outputDirectory>${project.build.directory}/lib</outputDirectory>
+              <includeScope>runtime</includeScope>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

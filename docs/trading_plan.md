@@ -1,8 +1,8 @@
 # Trading: what was built and how it works
 
-Status: **step 1 done (paper trading)**. `python -m trading --help`; Airflow DAGs
-`dukascopy_hourly`, `trading_gate`, `trading_live`. Next: Dukascopy demo account as a
-broker (step 2, below).
+Status: **step 1 done (paper trading); step 2 (Dukascopy demo broker) built, being
+checked** (below). `python -m trading --help`; Airflow DAGs `dukascopy_hourly`,
+`trading_gate`, `trading_live`.
 
 ## Goal
 
@@ -256,17 +256,64 @@ In Airflow, unpause `dukascopy_hourly`, `trading_gate` and `trading_live`.
 
 ## Step 2: Dukascopy demo account
 
-Dukascopy has no Python API, so the plan is:
+Status: **built and checked against the demo account** (login, prices, one 1 oz XAUUSD order
+filled with stop and target attached, closed, read back after a bridge restart). Paper stays
+the default (`TRADING_BROKER=paper`) until you switch.
 
-1. A small Java bridge on the official JForex SDK (or the open-source `dukas-proxy`, after
-   checking its order support), exposing orders, positions and live prices over
-   REST/WebSocket on localhost.
-2. `trading/brokers/dukascopy.py` implementing `Broker` over that bridge (`realtime = True`):
-   `submit` sends a market order with stop/target and the order_id as client id; `sync`
-   reads fills and exits back.
-3. Live prices from the same connection, so signals no longer wait for the hourly files.
-   That removes the 10–30 minute delay.
+```
+trading_live ──> trading/brokers/dukascopy.py ──HTTP 127.0.0.1:8765──> bridge/ (Java, JForex SDK) ──> Dukascopy
+```
 
-Needs from you: the demo login in `.env` (`DUKASCOPY_DEMO_USER`, `DUKASCOPY_DEMO_PASSWORD`;
-never committed), and the machine's IP registered on the account so login doesn't ask for a
-PIN.
+**dlh-bridge** (`bridge/`, `bridge/run.sh`): one Java file on the official JForex SDK
+(`DDS2-jClient-JForex` 3.6.51 from Dukascopy's Maven repo; needs Java 17 and Maven). It
+logs in with `DUKASCOPY_DEMO_USER` / `DUKASCOPY_DEMO_PASSWORD`, reconnects on its own, and
+serves on localhost only:
+
+| Endpoint | What |
+|---|---|
+| `GET /health`, `GET /account` | connected, account id; balance, equity, currency |
+| `GET /tick?symbol=XAUUSD` | last bid / ask |
+| `POST /orders` | market order with stop and target attached, labelled with the order id |
+| `GET /orders/{label}?symbol=&since=` | the order, active or from the account history |
+| `POST /orders/{label}/close` | close at market (manual checks only) |
+
+The open-source `dukas-proxy` was checked first: it only serves account and market data
+(no order endpoints, last changed 2020, AGPL), so it wasn't used.
+
+**`DukascopyBroker`** (`realtime = True`):
+
+- `submit` sizes from the live price: qty = risk / distance from the ask (long) or bid
+  (short) to the stop. The bridge rounds down to the instrument's step (XAUUSD: 1 oz) and
+  rejects below the minimum. JForex wants millions; the HTTP API is in units.
+- The label is the order id with `:` → `_` (`supply_demand_1h_XAUUSD_20261103T0100`). The
+  bridge returns an existing label instead of sending it again: the third guard against
+  double orders.
+- `sync` reads pending orders and open positions back by label and Dukascopy id: fill price
+  and time, closes, PnL and commission in the account currency. Dukascopy's PnL is the price
+  move only and its commission is charged on entry and exit (XAUUSD demo: $0.18 per oz each
+  way), so pnl = Dukascopy's PnL − commission. Its history drops the stop and target once a
+  position closes, so stop / target / closed (by hand) is decided from our own levels.
+- `balance` is the account's, so sizing (`BACKTEST_RISK_PER_TRADE` × balance) and the risk
+  limits use the real account, not `TRADING_PAPER_CAPITAL`.
+- Only a signal on the newest bar is ordered; older ones are skipped as stale.
+
+**Checks:**
+
+```bash
+bridge/run.sh                                   # keep it running (a terminal or a launchd job)
+python -m trading broker-check                  # login, account, live price: no orders
+python -m trading broker-check --order long     # one 1 oz order with stop/target 0.5% away, then closed
+```
+
+Then set `TRADING_BROKER=dukascopy` in `.env` and restart Airflow (it reads `.env` at start).
+
+**Still open:**
+
+- The bridge must be running whenever `trading_live` runs; if it isn't, the step fails with
+  "start it with bridge/run.sh". A launchd job would keep it up.
+- If the machine's public IP changes, login hits the PIN check again: register the new IP.
+- Live prices from the bridge (to remove the 10–30 minute delay) are not used yet.
+- The bridge sends market orders with 5 pips of allowed slippage (XAUUSD: $0.05). In a fast
+  market Dukascopy rejects rather than fills wider; the step records that as rejected.
+- SDK history calls block on Dukascopy's servers, so the bridge runs them on the HTTP thread
+  (on the strategy thread they never return).

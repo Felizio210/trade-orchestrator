@@ -25,7 +25,8 @@ emulation** of GCP or **real GCP**, with the same code.
 
 python -m ingestion.dukascopy --help           # download | convert | check | setup | publish | load | run | backfill
 python -m backtest --help                      # setup | strategies | run | list
-python -m trading --help                       # setup | gate | step | status | kill | resume
+python -m trading --help                       # setup | gate | step | status | kill | resume | broker-check
+bridge/run.sh                                  # dlh-bridge (JForex SDK, Java 17 + Maven) for TRADING_BROKER=dukascopy
 python -m cloud --help                         # status | gcs | pubsub | bq | reset (inspect either backend)
 
 airflow/start.sh                               # Airflow standalone, UI at http://localhost:8080
@@ -45,9 +46,13 @@ source airflow/env.sh                          # required before any other `airf
   (simulation), `metrics.py`, `runner.py` (load → signals → simulate → metrics → write),
   `tables.py`. Design notes in `docs/backtest_plan.md`.
 - `trading/` — `gate.py` (backtest metrics → approvals), `executor.py` (one step: new bars →
-  broker sync → signals → risk → orders), `brokers/` (`base.py` interface, `paper.py` with the
+  broker sync → signals → risk → orders), `brokers/` (`base.py` interface, `dukascopy.py` over dlh-bridge, `paper.py` with the
   engine's fill rules), `risk.py`, `store.py` (records + keyed reads/writes), `tables.py`.
   Design notes in `docs/trading_plan.md`.
+- `bridge/` — dlh-bridge: one Java file on the JForex SDK that logs in to the Dukascopy account
+  and serves orders/positions/account/ticks on 127.0.0.1 (`TRADING_BRIDGE_URL`). SDK calls must
+  run on the strategy thread (`IContext.executeTask`); JForex amounts are millions, the HTTP
+  API uses units.
 - `airflow/dags/` — `dukascopy_hourly` (hourly at :10, the only scheduled download:
   `finalize` publishes yesterday to the lake once it's complete, `load` drains it into
   BigQuery, `intraday` loads today's closed hours as provisional bars), `dukascopy_repair`

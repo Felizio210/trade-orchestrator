@@ -68,8 +68,11 @@ class Book:
     orders: list[Order]
     positions: list[Position]  # open ones, plus those closed since the first day being processed
     dirty: dict[str, Order | Position] = field(default_factory=dict)
+    account_balance: float | None = None  # the broker's, when it holds the account
 
     def balance(self) -> float:
+        if self.account_balance is not None:
+            return self.account_balance
         closed = sum(p.pnl for p in self.positions if p.status == "closed")
         open_commission = sum(p.entry_commission for p in self.positions if p.status == "open")
         return self.capital + self.realized_before + closed - open_commission
@@ -118,7 +121,8 @@ def step(settings: TradingSettings, backtest: BacktestSettings, market: Settings
     realized = cloud.bq.query(
         f"SELECT SUM(pnl) AS pnl FROM `{table_id(ds, 'positions')}` WHERE status = 'closed' AND exit_ts < @since",
         {"since": since})["pnl"].iloc[0]
-    book = Book(settings.paper_capital, float(store.clean(realized) or 0.0), orders, positions)
+    book = Book(settings.paper_capital, float(store.clean(realized) or 0.0), orders, positions,
+                account_balance=broker.balance())
     controls = store.read(cloud, ds, "controls")
     kill = controls.loc[controls["key"] == KILL_SWITCH, "value"].dropna()
     kill_reason = kill.iloc[0] if len(kill) and kill.iloc[0] else None
