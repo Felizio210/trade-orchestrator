@@ -42,7 +42,7 @@ source airflow/env.sh                          # required before any other `airf
   `downloader.py` (raw `.bi5` + `_manifest.json` per day), `converter.py`/`transform.py`
   (ticks → bars), `pipeline.py` (publish to GCS + Pub/Sub, load into BigQuery, backfill),
   `tables.py` (schemas), `instruments.py` (point scales per symbol).
-- `backtest/` — `strategies/` (registry + `supply_demand`, `trendline`), `engine.py`
+- `backtest/` — `strategies/` (registry + `supply_demand`, `trendline`, `silver_bullet`, `breakout`), `engine.py`
   (simulation), `metrics.py`, `runner.py` (load → signals → simulate → metrics → write),
   `tables.py`. Design notes in `docs/backtest_plan.md`.
 - `trading/` — `gate.py` (backtest metrics → approvals), `executor.py` (one step: new bars →

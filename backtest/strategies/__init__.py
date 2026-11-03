@@ -16,9 +16,11 @@ from typing import Any
 
 import pandas as pd
 
-from backtest.strategies import supply_demand, trendline
+from backtest.strategies import breakout, silver_bullet, supply_demand, trendline
 
 STRATEGIES: dict[str, ModuleType] = {
+    "breakout": breakout,
+    "silver_bullet": silver_bullet,
     "supply_demand": supply_demand,
     "trendline": trendline,
 }

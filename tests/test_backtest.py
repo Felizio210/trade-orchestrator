@@ -24,12 +24,13 @@ def make_bars(rows, start="2026-09-01", freq="1h"):
     return df
 
 
-def random_bars(n=1500, seed=7):
+def random_bars(n=1500, seed=7, freq="1h"):
     rng = np.random.default_rng(seed)
     close = 1.1 + np.cumsum(rng.normal(0, 0.001, n) * rng.choice([1, 1, 1, 4], n))
     open_ = np.r_[close[0], close[:-1]]
     spread = np.abs(rng.normal(0, 0.0007, n))
-    return make_bars(np.c_[open_, np.maximum(open_, close) + spread, np.minimum(open_, close) - spread, close])
+    return make_bars(np.c_[open_, np.maximum(open_, close) + spread, np.minimum(open_, close) - spread, close],
+                     freq=freq)
 
 
 def signal_frame(n, at=None):
@@ -112,13 +113,18 @@ def test_bar_labels_show_trade_that_opens_and_stops_in_one_bar():
 
 # --- strategies ---
 
-@pytest.mark.parametrize("name,overrides", [
-    ("supply_demand", {}),
-    ("trendline", {"mode": "bounce"}),
-    ("trendline", {"mode": "break"}),
+SILVER_BULLET_5MIN = {"windows": ",".join(map(str, range(24))), "disp_body_atr": "0.5"}  # every hour, for signals
+
+
+@pytest.mark.parametrize("name,overrides,freq", [
+    ("supply_demand", {}, "1h"),
+    ("trendline", {"mode": "bounce"}, "1h"),
+    ("trendline", {"mode": "break"}, "1h"),
+    ("silver_bullet", SILVER_BULLET_5MIN, "5min"),
+    ("breakout", {"slow": "50"}, "1h"),
 ])
-def test_strategies_never_look_ahead(name, overrides):
-    bars = random_bars()
+def test_strategies_never_look_ahead(name, overrides, freq):
+    bars = random_bars(freq=freq)
     params = strategies.resolve_params(name, overrides)
     full = strategies.run(name, bars, params)
     assert (full["signal"] != 0).sum() > 5, "the test data should produce signals"
@@ -127,14 +133,53 @@ def test_strategies_never_look_ahead(name, overrides):
         pd.testing.assert_frame_equal(prefix, full.iloc[:k].reset_index(drop=True))
 
 
-@pytest.mark.parametrize("name", ["supply_demand", "trendline"])
-def test_signals_have_stop_on_the_losing_side(name):
-    bars = random_bars()
-    sig = strategies.run(name, bars, strategies.resolve_params(name))
+@pytest.mark.parametrize("name,overrides,freq", [
+    ("supply_demand", {}, "1h"),
+    ("trendline", {}, "1h"),
+    ("silver_bullet", SILVER_BULLET_5MIN, "5min"),
+    ("breakout", {}, "1h"),
+])
+def test_signals_have_stop_on_the_losing_side(name, overrides, freq):
+    bars = random_bars(freq=freq)
+    sig = strategies.run(name, bars, strategies.resolve_params(name, overrides))
     s = sig[sig["signal"] != 0]
     close = bars.loc[s.index, "close"]
     assert ((s["stop"] - close) * s["signal"] < 0).all()
     assert ((s["target"] - close) * s["signal"] > 0).all()
+
+
+def test_silver_bullet_buys_retrace_into_gap_after_sweep():
+    # 5min bars from 09:00 New York (EDT, 13:00 UTC); the 10:00 window opens at bar 12.
+    # Before it the range is 9.8-10.2. In the window: bar 13 sweeps below 9.8, bar 14 is the
+    # up displacement, bar 15's low 10.3 leaves a gap over bar 13's high 10.0, bar 17 dips
+    # back into it and closes above -> long, stop under the sweep low 9.5.
+    pre = [(10, 10.2, 9.8, 10)] * 12
+    window = [(10, 10.1, 9.9, 10), (10, 10.0, 9.5, 9.7), (9.7, 10.6, 9.7, 10.5),
+              (10.5, 10.8, 10.3, 10.7), (10.7, 10.9, 10.5, 10.8), (10.8, 10.8, 10.2, 10.4),
+              (10.4, 10.6, 10.3, 10.5)]
+    bars = make_bars(pre + window, start="2026-09-01 13:00", freq="5min")
+    sig = strategies.run("silver_bullet", bars, strategies.resolve_params("silver_bullet", {"atr_len": "3"}))
+    assert sig.index[sig["signal"] != 0].tolist() == [17] and sig["signal"][17] == 1
+    assert sig["stop"][17] < 9.5 < bars["close"][17] < sig["target"][17]
+
+
+def test_silver_bullet_ignores_setups_outside_the_windows():
+    pre = [(10, 10.2, 9.8, 10)] * 12
+    setup = [(10, 10.1, 9.9, 10), (10, 10.0, 9.5, 9.7), (9.7, 10.6, 9.7, 10.5),
+             (10.5, 10.8, 10.3, 10.7), (10.7, 10.9, 10.5, 10.8), (10.8, 10.8, 10.2, 10.4)]
+    bars = make_bars(pre + setup, start="2026-09-01 15:00", freq="5min")  # 11:00-12:00 New York
+    sig = strategies.run("silver_bullet", bars, strategies.resolve_params("silver_bullet", {"atr_len": "3"}))
+    assert (sig["signal"] == 0).all()
+
+
+def test_breakout_buys_a_close_above_the_channel_in_an_uptrend():
+    # A slow climb keeps the close above its EMA; bar 30 closes above the last 10 bars' highs
+    climb = [(10 + 0.01 * i, 10.3 + 0.01 * i, 9.9 + 0.01 * i, 10 + 0.01 * i) for i in range(30)]
+    bars = make_bars(climb + [(10.3, 11.2, 10.3, 11.0)])
+    params = strategies.resolve_params("breakout", {"length": "10", "slow": "5", "atr_len": "3"})
+    sig = strategies.run("breakout", bars, params)
+    assert sig["signal"].iloc[-1] == 1
+    assert sig["stop"].iloc[-1] < 11.0 < sig["target"].iloc[-1]
 
 
 def test_supply_demand_trades_demand_zone_retest():
