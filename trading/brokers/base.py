@@ -40,3 +40,8 @@ class Broker(ABC):
         """The account balance when the broker holds one; None means the executor computes it
         from TRADING_PAPER_CAPITAL and the recorded positions."""
         return None
+
+    def equity(self) -> float | None:
+        """The account equity when the broker holds one, so it includes whatever happened outside
+        this system (manual trades, swaps, fees); None means balance + open PnL of our positions."""
+        return None

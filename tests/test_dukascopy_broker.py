@@ -19,15 +19,16 @@ T0 = pd.Timestamp("2026-11-03 10:00", tz="UTC")
 class FakeBridge(DukascopyBroker):
     """Answers like bridge/ does: market orders fill at once at the bid/ask, labels are unique."""
 
-    def __init__(self, bid=100.0, ask=100.2, balance=50_000.0):
+    def __init__(self, bid=100.0, ask=100.2, balance=50_000.0, equity=None):
         super().__init__("http://bridge.test")
         self.bid, self.ask, self.account_balance = bid, ask, balance
+        self.account_equity = balance if equity is None else equity
         self.orders: dict[str, dict] = {}
         self.sent: list[dict] = []
 
     def _call(self, method, path, body=None, **query):
         if path == "/account":
-            return {"balance": self.account_balance, "equity": self.account_balance, "currency": "USD"}
+            return {"balance": self.account_balance, "equity": self.account_equity, "currency": "USD"}
         if path == "/tick":
             return {"bid": self.bid, "ask": self.ask, "time": int(T0.timestamp() * 1000)}
         if method == "POST" and path == "/orders":
@@ -151,3 +152,14 @@ def test_step_orders_only_on_the_newest_bar_sized_from_the_account(env):
     [o] = store.records(store.read(cloud, "trading", "orders"), Order)
     assert o.risk == pytest.approx(50_000.0 * backtest.risk_per_trade)  # the account's balance, not paper capital
     assert result["balance"] == 50_000.0
+
+
+def test_account_snapshot_records_the_brokers_equity(env):
+    # A test order closed at Dukascopy outside this system: the equity has the loss, the balance not yet
+    cloud, market, backtest, bars = env
+    set_cursor(cloud, bars["ts"].iloc[-2])
+    result = step(NO_LIMITS, backtest, market, cloud, broker=FakeBridge(balance=10_000.0, equity=9_999.56),
+                  now=after(bars, len(bars) - 1))
+    [row] = store.read(cloud, "trading", "account").itertuples()
+    assert (row.balance, row.equity) == (10_000.0, 9_999.56)
+    assert result["equity"] == 9_999.56

@@ -205,8 +205,10 @@ def step(settings: TradingSettings, backtest: BacktestSettings, market: Settings
         store.write(cloud, ds, "controls", [{"key": KILL_SWITCH, "value": kill_reason, "updated_at": now}])
     open_positions = [p for p in book.positions if p.status == "open"]
     balance = book.balance()
-    equity = balance + sum(broker.unrealized(p, marks[(p.timeframe, p.symbol)])
-                           for p in open_positions if (p.timeframe, p.symbol) in marks)
+    equity = broker.equity()
+    if equity is None:
+        equity = balance + sum(broker.unrealized(p, marks[(p.timeframe, p.symbol)])
+                               for p in open_positions if (p.timeframe, p.symbol) in marks)
     open_risk = sum(r.risk for r in book.live())
     store.write(cloud, ds, "account", [{
         "ts": now, "date": now.date(), "broker": broker.name, "balance": balance, "equity": equity,

@@ -83,6 +83,9 @@ class DukascopyBroker(Broker):
     def balance(self) -> float:
         return float(self._call("GET", "/account")["balance"])
 
+    def equity(self) -> float:
+        return float(self._call("GET", "/account")["equity"])
+
     def order(self, order_id: str, symbol: str, since: pd.Timestamp | None = None,
               broker_id: str | None = None) -> dict | None:
         since = since or pd.Timestamp(datetime.now(timezone.utc) - timedelta(days=HISTORY_DAYS))
