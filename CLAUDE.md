@@ -55,7 +55,8 @@ source airflow/env.sh                          # required before any other `airf
   API uses units.
 - `airflow/dags/` — `dukascopy_hourly` (hourly at :10, the only scheduled download:
   `finalize` publishes yesterday to the lake once it's complete, `load` drains it into
-  BigQuery, `intraday` loads today's closed hours as provisional bars), `dukascopy_repair`
+  BigQuery, `intraday` loads today's closed hours as provisional bars, `freshness` fails when the newest
+  bars are more than `DUKASCOPY_MAX_LAG_HOURS` market hours old), `dukascopy_repair`
   (09:00 UTC gap fill over the last days), `dukascopy_setup` (manual), `backtest_daily`
   (triggered by the `dlh://market/bars` Dataset, which only `dukascopy_repair` emits, once the
   repair window has no gaps), `trading_gate` (on `dlh://backtest/metrics` from `backtest_daily`)

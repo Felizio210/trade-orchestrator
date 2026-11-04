@@ -375,3 +375,38 @@ def test_finalize_fails_on_incomplete_day_and_skips_saturday(tmp_path, monkeypat
 
     result = dlh_tasks.finalize(data_interval_end=datetime(2026, 11, 1, 5, 10, tzinfo=timezone.utc))
     assert result == {"date": "2026-10-31", "skipped": "saturday"}
+
+
+def test_freshness_passes_on_current_bars_and_fails_on_a_stall(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+
+    dlh_tasks, settings, cloud, fetched = _tasks(tmp_path, monkeypatch)
+    # a Thursday: bars up to the 02h bar, loaded at 03:10 (the fake has one tick per hour, at :00)
+    dlh_tasks.intraday(data_interval_end=datetime(2026, 10, 29, 3, 10, tzinfo=timezone.utc))
+
+    ok = dlh_tasks.freshness(data_interval_end=datetime(2026, 10, 29, 3, 10, tzinfo=timezone.utc))
+    assert ok == {"EURUSD 1min": "2026-10-29 02:00 (0h behind)", "EURUSD 1h": "2026-10-29 02:00 (0h behind)"}
+    # two hours later with no new bars: 2h behind, still within the default 2h
+    dlh_tasks.freshness(data_interval_end=datetime(2026, 10, 29, 5, 10, tzinfo=timezone.utc))
+    with pytest.raises(RuntimeError, match="EURUSD 1h: newest bar 2026-10-29 02:00, 3 market hours behind"):
+        dlh_tasks.freshness(data_interval_end=datetime(2026, 10, 29, 6, 10, tzinfo=timezone.utc))
+    monkeypatch.setenv("DUKASCOPY_MAX_LAG_HOURS", "5")
+    dlh_tasks.freshness(data_interval_end=datetime(2026, 10, 29, 6, 10, tzinfo=timezone.utc))
+
+
+def test_freshness_ignores_closed_market_hours(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+
+    dlh_tasks, settings, cloud, fetched = _tasks(tmp_path, monkeypatch)
+    # Friday's last open hour is 20h; the market reopens Sunday 22:00
+    dlh_tasks.intraday(data_interval_end=datetime(2026, 10, 30, 21, 10, tzinfo=timezone.utc))
+    weekend = dlh_tasks.freshness(data_interval_end=datetime(2026, 11, 1, 23, 10, tzinfo=timezone.utc))
+    assert weekend["EURUSD 1h"].endswith("(1h behind)")  # only Sunday 22h counts
+
+
+def test_freshness_fails_when_a_symbol_has_no_bars(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+
+    dlh_tasks, settings, cloud, fetched = _tasks(tmp_path, monkeypatch)
+    with pytest.raises(RuntimeError, match="EURUSD 1min: no bars"):
+        dlh_tasks.freshness(data_interval_end=datetime(2026, 10, 29, 3, 10, tzinfo=timezone.utc))

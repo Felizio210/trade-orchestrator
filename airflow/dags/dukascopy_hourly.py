@@ -7,7 +7,8 @@ hours of today straight into the bars tables as provisional rows, which tomorrow
 replaces. dukascopy_repair (09:00) fills anything finalize missed.
 
 intraday runs whatever finalize did, so trading never waits on yesterday; a failed finalize
-or load still marks the run failed. Emits the hourly bars Dataset, which triggers trading_live.
+or load still marks the run failed. freshness fails the run when the newest bars are too old,
+so a stalled feed shows up as a failed task. Emits the hourly bars Dataset, which triggers trading_live.
 """
 
 from datetime import timedelta
@@ -37,6 +38,12 @@ with DAG(
     intraday = PythonOperator(task_id="intraday", python_callable=dlh_tasks.intraday,
                               trigger_rule=TriggerRule.ALL_DONE)
     notify = EmptyOperator(task_id="notify", outlets=[Dataset(dlh_tasks.HOURLY_BARS)])
+    # Runs whatever intraday did (a stall is exactly when intraday fails); fails when the
+    # newest bars are more than DUKASCOPY_MAX_LAG_HOURS market hours old. No retries: the
+    # next hourly run checks again.
+    freshness = PythonOperator(task_id="freshness", python_callable=dlh_tasks.freshness,
+                               retries=0, trigger_rule=TriggerRule.ALL_DONE)
 
     finalize >> [load, intraday]
     intraday >> notify
+    [load, intraday] >> freshness

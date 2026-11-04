@@ -128,6 +128,49 @@ def _market_open(hour) -> bool:
                 or hour.hour == 21)
 
 
+def freshness(data_interval_end, **_) -> dict:
+    """Fail when a symbol's newest bar is too old, so a stalled feed doesn't go unnoticed.
+
+    For every bar timeframe up to 1h, counts the market-open hours that have closed since
+    each symbol's newest bar closed. More than DUKASCOPY_MAX_LAG_HOURS (default 2) fails the
+    task. Closed-market hours don't count, so weekends never look stale.
+    """
+    from datetime import timedelta
+
+    import pandas as pd
+
+    pipeline, settings, cloud = _pipeline()
+    from ingestion.dukascopy.tables import bq_table_id, dataset_name
+
+    max_lag = int(os.environ.get("DUKASCOPY_MAX_LAG_HOURS", "2"))
+    now_hour = pd.Timestamp(data_interval_end).tz_convert("UTC").floor("h")
+    symbols = [s.upper() for s in settings.symbols]
+    lags, stale = {}, []
+    for tf in settings.bar_timeframes:
+        step = pd.Timedelta(pd.tseries.frequencies.to_offset(tf))
+        if step > timedelta(hours=1):
+            continue
+        table = bq_table_id(settings.bq_dataset, dataset_name("bars", tf))
+        rows = cloud.bq.query(f"SELECT symbol, MAX(ts) AS ts FROM {table} GROUP BY symbol")
+        newest = dict(zip(rows["symbol"], pd.to_datetime(rows["ts"], utc=True)))  # strings locally
+        for symbol in symbols:
+            if symbol not in newest:
+                stale.append(f"{symbol} {tf}: no bars")
+                continue
+            hour = (newest[symbol] + step).ceil("h")  # first hour that should have a newer bar
+            missing = 0
+            while hour < now_hour:
+                missing += _market_open(hour)
+                hour += pd.Timedelta(hours=1)
+            lags[f"{symbol} {tf}"] = f"{newest[symbol]:%Y-%m-%d %H:%M} ({missing}h behind)"
+            if missing > max_lag:
+                stale.append(f"{symbol} {tf}: newest bar {newest[symbol]:%Y-%m-%d %H:%M}, "
+                             f"{missing} market hours behind")
+    if stale:
+        raise RuntimeError(f"stale market data (max {max_lag}h): " + "; ".join(stale))
+    return lags
+
+
 def intraday(data_interval_end, **_) -> dict:
     """Load the closed hours of the current UTC day for every symbol, as provisional rows.
 
