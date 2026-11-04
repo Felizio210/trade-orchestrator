@@ -121,6 +121,17 @@ def test_gate_approves_revokes_and_ignores_adhoc_runs(env):
     assert events["kind"].tolist() == ["approved", "revoked"]
 
 
+def test_gate_rejects_timeframes_faster_than_the_trading_schedule(env):
+    cloud, _market, backtest, _bars = env
+    t0 = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    write_metrics(cloud, "daily-1min", t0)  # good metrics, but on 1min bars
+    runs = cloud.bq.query("SELECT * FROM backtest.runs WHERE run_id = 'daily-1min'").assign(timeframe="1min")
+    cloud.bq.replace_from_dataframe(runs, "backtest.runs", {"run_id": "daily-1min"})
+    [row] = evaluate(TradingSettings(), backtest, cloud, now=t0)
+    assert (row["timeframe"], row["status"]) == ("1min", "rejected")
+    assert row["reasons"] == "1min is faster than trading_live's 5min schedule"
+
+
 # --- paper trading ---
 
 def approve(cloud, decided_at, params=None, symbol="EURUSD"):

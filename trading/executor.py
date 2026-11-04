@@ -4,10 +4,14 @@
        pending orders, open positions, each timeframe/symbol's cursor (newest bar processed).
     2. Pending orders of strategies no longer approved are cancelled. Open positions keep
        running to their stop or target.
-    3. For every timeframe/symbol with an approved strategy or something open: load the new
-       closed bars plus TRADING_WARMUP_DAYS before them, and run each approved strategy over
-       them with its approved parameters. Strategies have no lookahead, so the signal on a
-       bar is the one the backtest would have produced there.
+    3. For every timeframe/symbol with an approved strategy or something open, unless its next
+       bar hasn't closed yet: load the new closed bars plus TRADING_WARMUP_DAYS before them,
+       and run each approved strategy over them with its approved parameters. Strategies have
+       no lookahead, so the signal on a bar is the one the backtest would have produced there.
+       The warehouse only gets bars once an hour (dukascopy_hourly), so timeframes under 1h
+       also take the bars the broker's live feed has after the warehouse's newest one (the
+       Dukascopy broker has one; paper doesn't): a 5min signal is acted on right after its bar
+       closes, not up to an hour later, when the realtime broker would skip it as stale.
     4. Walk the new bars of every timeframe/symbol in close-time order. On each bar the
        broker fills pending orders and applies stops/targets, the daily loss limit is
        checked, and each signal goes through the risk checks and becomes an order that
@@ -40,13 +44,15 @@ from cloud import Cloud
 from ingestion.dukascopy.config import Settings
 from trading import brokers, risk, store
 from trading.brokers.base import Broker
-from trading.config import TradingSettings
+from trading.config import MIN_TIMEFRAME, TradingSettings
 from trading.store import Order, Position
 from trading.tables import table_id
 
 log = logging.getLogger(__name__)
 
 KILL_SWITCH = "kill_switch"
+# Timeframes faster than this also take the broker's live bars; slower ones use the warehouse only
+LIVE_BARS_BELOW = pd.Timedelta("1h")
 
 
 def signal_id(strategy: str, timeframe: str, symbol: str, bar_ts: pd.Timestamp) -> str:
@@ -112,7 +118,8 @@ def step(settings: TradingSettings, backtest: BacktestSettings, market: Settings
     approvals = store.read(cloud, ds, "approvals", "status = 'approved'")
     fresh = approvals["decided_at"] >= now - timedelta(days=settings.approval_max_age_days)
     approved = {(r.strategy, r.timeframe, r.symbol): json.loads(r.params_json)
-                for r in approvals[fresh].itertuples()}
+                for r in approvals[fresh].itertuples()
+                if pd.Timedelta(r.timeframe) >= pd.Timedelta(MIN_TIMEFRAME)}  # the gate rejects faster ones too
     cursors = {(r.timeframe, r.symbol): r.last_bar_ts for r in store.read(cloud, ds, "cursors").itertuples()}
     since = min(cursors.values()).floor("D") if cursors else now.floor("D")
     orders = store.records(store.read(cloud, ds, "orders", "status = 'pending'"), Order)
@@ -142,9 +149,14 @@ def step(settings: TradingSettings, backtest: BacktestSettings, market: Settings
     timeline = []
     for tf, sym in sorted(groups):
         cursor = cursors.get((tf, sym))
+        span = pd.Timedelta(tf)
+        if cursor is not None and cursor + 2 * span > now:
+            continue  # the bar after the cursor hasn't closed: nothing new, skip the warehouse query
         start = (cursor if cursor is not None else now) - timedelta(days=settings.warmup_days)
         bars = load_bars(cloud, market, sym, tf, start.date(), now.date())
-        bars = bars[bars["ts"] + pd.Timedelta(tf) <= now].reset_index(drop=True)  # closed bars only
+        if span < LIVE_BARS_BELOW:
+            bars = _with_live_bars(bars, broker, sym, tf, start, now, market.bar_price_side)
+        bars = bars[bars["ts"] + span <= now].reset_index(drop=True)  # closed bars only
         if bars.empty:
             log.warning("%s %s: no closed bars to trade on", sym, tf)
             continue
@@ -217,6 +229,19 @@ def step(settings: TradingSettings, backtest: BacktestSettings, market: Settings
     store.write(cloud, ds, "events", list({e["event_id"]: e for e in events}.values()))
     return {**counts, "balance": balance, "equity": equity, "open_positions": len(open_positions),
             "pending_orders": sum(o.status == "pending" for o in book.orders), "kill_switch": kill_reason}
+
+
+def _with_live_bars(bars: pd.DataFrame, broker: Broker, symbol: str, tf: str, start: pd.Timestamp,
+                    now: pd.Timestamp, price_side: str) -> pd.DataFrame:
+    """The warehouse bars, then the broker's live bars that open after the newest of them.
+    Next day's finalize replaces these in the warehouse, which is what later steps warm up on."""
+    after = bars["ts"].iloc[-1] if len(bars) else start
+    side = bars["price_side"].iloc[-1] if len(bars) else price_side
+    live = broker.bars(symbol, tf, after, side)
+    if live is None or live.empty:
+        return bars
+    live = live[live["ts"] > after].assign(price_side=side, ingested_at=now)
+    return pd.concat([bars, live[bars.columns]], ignore_index=True) if len(bars) else live.reset_index(drop=True)
 
 
 def _handle_signal(strategy, tf, sym, bar, sig, side, *, now, settings, backtest, cloud, broker, book,

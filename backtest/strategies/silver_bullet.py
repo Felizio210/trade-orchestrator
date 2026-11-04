@@ -12,6 +12,9 @@ value gap in the other direction, traded on the first retrace into the gap.
     target:   rr x risk
 
 One trade per window. Bars use their open time, so a bar is in a window when it opens in it.
+A setup needs at least three bars inside one window (sweep and displacement, the bar that
+completes the gap, the retrace), so it only runs on 15min bars or faster: on 1h bars a window
+is a single bar and nothing could ever signal.
 """
 
 from __future__ import annotations
@@ -20,6 +23,8 @@ import numpy as np
 import pandas as pd
 
 from backtest.strategies.common import atr, empty_signals, to_frame
+
+MAX_TIMEFRAME = "15min"
 
 DEFAULTS = {
     "windows": "3,10,14",  # New York start hours of the one-hour windows

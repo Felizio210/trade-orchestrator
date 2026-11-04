@@ -22,7 +22,7 @@ dukascopy_repair 09:00 ──> backtest_daily      dukascopy_hourly :10
                     metrics vs standards                   -> market_* (provisional)
                     -> trading.approvals                   │
                                                            v
-                                                     trading_live
+                                                     trading_live (every 5 min)
                                                new bars -> signals of approved
                                                strategies -> risk -> orders -> broker
                                                            │
@@ -35,7 +35,15 @@ Airflow Datasets chain the DAGs, so each one runs right after what it depends on
 |---|---|---|
 | `dlh://market/bars` | `dukascopy_repair` (window gap-free) | `backtest_daily` |
 | `dlh://backtest/metrics` (new) | `backtest_daily` (all backtests succeeded) | `trading_gate` |
-| `dlh://market/bars/hourly` (new) | `dukascopy_hourly` | `trading_live` |
+| `dlh://market/bars/hourly` (new) | `dukascopy_hourly` | nothing (`trading_live` runs every 5 minutes) |
+
+`trading_live` is on a 5-minute cron (`1-59/5`, a minute after each 5min bar closes) rather than that Dataset: the warehouse only gets
+bars once an hour, so a 5min signal would reach the step up to an hour late, when the
+realtime broker skips it as stale and the setup has expired. Timeframes under 1h take the
+newest bars from the broker's live feed instead (step 3 below). 5min bars are pulled every run, 15min every third run (:01, :16, :31,
+:46), 1h once the hour is in the warehouse. A 1min strategy would only trade one bar in
+five on this schedule (the rest are stale by the next run), so the gate rejects anything
+faster than 5min (`MIN_TIMEFRAME` in `trading/config.py`) and the step ignores it.
 
 ## Where state lives
 
@@ -122,10 +130,16 @@ Each run of `trading_live` (and `python -m trading step`) does:
 
 1. **Load state:** fresh approvals, pending orders, open positions, cursors, kill switch.
 2. **Cancel** pending orders of strategies that are no longer approved.
-3. **For each timeframe/symbol** with an approved strategy or something open: load the
-   bars that closed since the cursor, plus `TRADING_WARMUP_DAYS` (60) before them, and run
-   each approved strategy over them with its approved parameters. Strategies have no
-   lookahead, so the signal on a bar is the one the backtest would have produced there.
+3. **For each timeframe/symbol** with an approved strategy or something open, unless its
+   next bar hasn't closed yet (then it's skipped without a warehouse query, so most
+   runs only touch the timeframes with a bar due): load the bars that closed since the cursor, plus
+   `TRADING_WARMUP_DAYS` (60) before them, and run each approved strategy over them with its
+   approved parameters. Strategies have no lookahead, so the signal on a bar is the one the
+   backtest would have produced there. Timeframes **under 1h** add the broker's live bars
+   after the warehouse's newest one (`Broker.bars`; dlh-bridge's `/bars` for Dukascopy, none
+   for paper), so a 5min bar is traded the minute it closes. 1h and slower use the warehouse
+   only, as before. Next day's `finalize` replaces the day in the warehouse, which later
+   steps warm up on.
 4. **Walk the new bars** of all timeframe/symbols in close-time order. On each bar:
    - the broker fills pending orders at this bar's open and applies stops/targets;
    - the daily loss limit is checked;
@@ -203,6 +217,7 @@ class Broker(ABC):
     def submit(self, order) -> None     # market order with stop + target attached
     def sync(self, timeframe, symbol, bar, orders, positions) -> changed records
     def unrealized(self, position, bar) -> float
+    def bars(self, symbol, timeframe, after, price_side) -> DataFrame | None  # live feed; None = none
 ```
 
 Stops and targets are attached to the order, so they sit **at the broker**: a crashed or
@@ -273,6 +288,7 @@ serves on localhost only:
 |---|---|
 | `GET /health`, `GET /account` | connected, account id; balance, equity, currency |
 | `GET /tick?symbol=XAUUSD` | last bid / ask |
+| `GET /bars?symbol=&period=5min&side=bid&from=` | closed bars from the live feed (1min to 1h), flat ones left out |
 | `POST /orders` | market order with stop and target attached, labelled with the order id |
 | `GET /orders/{label}?symbol=&since=` | the order, active or from the account history |
 | `POST /orders/{label}/close` | close at market (manual checks only) |
@@ -295,6 +311,8 @@ The open-source `dukas-proxy` was checked first: it only serves account and mark
   position closes, so stop / target / closed (by hand) is decided from our own levels.
 - `balance` is the account's, so sizing (`BACKTEST_RISK_PER_TRADE` × balance) and the risk
   limits use the real account, not `TRADING_PAPER_CAPITAL`.
+- `bars` reads closed bars from `/bars` on `DUKASCOPY_BAR_PRICE_SIDE` (mid = the average of
+  the bid and ask bars), for timeframes under 1h.
 - Only a signal on the newest bar is ordered; older ones are skipped as stale.
 
 **Checks:**

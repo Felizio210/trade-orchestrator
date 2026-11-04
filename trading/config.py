@@ -17,6 +17,9 @@ except ImportError:
     pass
 
 BROKERS = ("paper", "dukascopy")
+# The fastest bars that can trade: trading_live runs every 5 minutes, and a realtime broker only
+# acts on the newest bar, so on faster bars most signals would be stale by the next run.
+MIN_TIMEFRAME = "5min"
 
 
 def _float(name: str, default: str) -> float | None:

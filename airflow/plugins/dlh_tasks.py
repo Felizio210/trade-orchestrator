@@ -154,7 +154,7 @@ def intraday(data_interval_end, **_) -> dict:
 # --- backtest ---
 
 MARKET_BARS = "dlh://market/bars"  # Dataset URI: dukascopy_repair emits it, backtest_daily runs on it
-HOURLY_BARS = "dlh://market/bars/hourly"  # dukascopy_hourly emits it, trading_live runs on it
+HOURLY_BARS = "dlh://market/bars/hourly"  # dukascopy_hourly emits it once today's bars are loaded (trading_live runs every 5 minutes)
 BACKTEST_RESULTS = "dlh://backtest/metrics"  # backtest_daily emits it, trading_gate runs on it
 
 

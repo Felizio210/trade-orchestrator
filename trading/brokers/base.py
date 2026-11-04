@@ -41,6 +41,12 @@ class Broker(ABC):
         from TRADING_PAPER_CAPITAL and the recorded positions."""
         return None
 
+    def bars(self, symbol: str, timeframe: str, after: pd.Timestamp, price_side: str) -> pd.DataFrame | None:
+        """Closed bars opening after `after`, straight from the broker's live feed (columns ts,
+        open, high, low, close, volume), so a step sees each bar as soon as it closes instead of
+        when the hourly load reaches the warehouse. None: no live feed, use the warehouse only."""
+        return None
+
     def equity(self) -> float | None:
         """The account equity when the broker holds one, so it includes whatever happened outside
         this system (manual trades, swaps, fees); None means balance + open PnL of our positions."""

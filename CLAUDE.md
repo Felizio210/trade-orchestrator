@@ -50,7 +50,7 @@ source airflow/env.sh                          # required before any other `airf
   engine's fill rules), `risk.py`, `store.py` (records + keyed reads/writes), `tables.py`.
   Design notes in `docs/trading_plan.md`.
 - `bridge/` — dlh-bridge: one Java file on the JForex SDK that logs in to the Dukascopy account
-  and serves orders/positions/account/ticks on 127.0.0.1 (`TRADING_BRIDGE_URL`). SDK calls must
+  and serves orders/positions/account/ticks/bars on 127.0.0.1 (`TRADING_BRIDGE_URL`). SDK calls must
   run on the strategy thread (`IContext.executeTask`); JForex amounts are millions, the HTTP
   API uses units.
 - `airflow/dags/` — `dukascopy_hourly` (hourly at :10, the only scheduled download:
@@ -59,7 +59,8 @@ source airflow/env.sh                          # required before any other `airf
   (09:00 UTC gap fill over the last days), `dukascopy_setup` (manual), `backtest_daily`
   (triggered by the `dlh://market/bars` Dataset, which only `dukascopy_repair` emits, once the
   repair window has no gaps), `trading_gate` (on `dlh://backtest/metrics` from `backtest_daily`)
-  and `trading_live` (on `dlh://market/bars/hourly` from `dukascopy_hourly`). The DAGs always
+  and `trading_live` (every 5 minutes; timeframes under 1h also take the broker's live bars from
+  dlh-bridge's `/bars`, 1h+ use the warehouse). The DAGs always
   build from ticks; `DUKASCOPY_BAR_SOURCE=candles` only affects the CLI.
   DAG files stay thin: all logic lives in `airflow/plugins/dlh_tasks.py`, which imports
   heavy modules inside functions so the scheduler parses DAGs cheaply.

@@ -5,7 +5,8 @@ TRADING_RUN_PREFIX ("daily-") is checked against the TRADING_MIN_* / TRADING_MAX
 thresholds. A pass is stored as approved together with that run's exact parameters, so
 trading never uses parameters that weren't backtested. Every failed check is written to
 `reasons`. A strategy that was approved and now fails is revoked: it opens no new
-positions, and its open ones run to their stop or target.
+positions, and its open ones run to their stop or target. Timeframes faster than
+MIN_TIMEFRAME (5min, trading_live's schedule) are always rejected, whatever their metrics.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from backtest.config import BacktestSettings
 from backtest.tables import table_id as bt_table
 from cloud import Cloud
 from trading import store
-from trading.config import TradingSettings
+from trading.config import MIN_TIMEFRAME, TradingSettings
 from trading.tables import TABLES, table_id
 
 log = logging.getLogger(__name__)
@@ -104,6 +105,8 @@ def evaluate(settings: TradingSettings, backtest: BacktestSettings, cloud: Cloud
     for m in latest.to_dict("records"):
         m = {k: store.clean(v) for k, v in m.items()}
         reasons = check(m, settings)
+        if pd.Timedelta(m["timeframe"]) < pd.Timedelta(MIN_TIMEFRAME):
+            reasons.append(f"{m['timeframe']} is faster than trading_live's {MIN_TIMEFRAME} schedule")
         key = (m["strategy"], m["timeframe"], m["symbol"])
         status = "rejected" if reasons else "approved"
         rows.append({

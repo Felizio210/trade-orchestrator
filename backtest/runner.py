@@ -67,8 +67,10 @@ def run(
     run_id: str | None = None,
 ) -> dict:
     """Backtest `strategy` on each symbol separately (each gets initial_capital) and store
-    the results. Returns {"run_id", "metrics": [...]}; raises after recording status=failed."""
+    the results. Returns {"run_id", "metrics": [...]}; raises after recording status=failed.
+    A timeframe the strategy can't work on is refused before anything is recorded."""
     settings.validate()
+    strategies.check_timeframe(strategy, timeframe)
     resolved = strategies.resolve_params(strategy, params)
     symbols = [s.upper() for s in symbols]
     run_id = run_id or new_run_id(strategy)

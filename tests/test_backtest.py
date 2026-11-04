@@ -272,6 +272,26 @@ def test_failed_run_is_recorded(env):
     assert row["status"][0] == "failed" and "sideways" in row["error"][0]
 
 
+def test_silver_bullet_refuses_hourly_bars(env, monkeypatch, capsys):
+    # On 1h bars a one-hour window is a single bar, so it could never trade: refused, not 0 trades
+    cloud, market, settings = env
+    with pytest.raises(ValueError, match="15min bars or faster, not 1h"):
+        run("silver_bullet", ["EURUSD"], "1h", date(2026, 9, 1), date(2026, 9, 30), settings, market, cloud,
+            run_id="sb-1h")
+    assert cloud.bq.query("SELECT run_id FROM backtest.runs WHERE run_id = 'sb-1h'").empty  # nothing recorded
+    strategies.check_timeframe("silver_bullet", "15min")
+    strategies.check_timeframe("supply_demand", "1h")  # no limit
+
+    # The CLI's default --timeframe is 1h: a clear error instead of an empty run
+    monkeypatch.setenv("DLH_ENV", "local")
+    monkeypatch.setenv("LOCAL_GCP_DIR", cloud.settings.local_dir)
+    monkeypatch.setenv("DUKASCOPY_BAR_TIMEFRAMES", "1h")
+    with pytest.raises(SystemExit) as exit_:
+        main(["run", "--strategy", "silver_bullet", "--symbols", "EURUSD", "--start", "2026-09-01",
+              "--end", "2026-09-30"])
+    assert exit_.value.code == 2 and "15min bars or faster" in capsys.readouterr().out
+
+
 def test_cli_run_and_list(env, monkeypatch, capsys):
     cloud, market, settings = env
     monkeypatch.setenv("DLH_ENV", "local")

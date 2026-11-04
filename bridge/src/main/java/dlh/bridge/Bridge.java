@@ -3,18 +3,22 @@ package dlh.bridge;
 import com.dukascopy.api.IAccount;
 import com.dukascopy.api.IBar;
 import com.dukascopy.api.IContext;
+import com.dukascopy.api.Filter;
 import com.dukascopy.api.IEngine;
+import com.dukascopy.api.IHistory;
 import com.dukascopy.api.IMessage;
 import com.dukascopy.api.IOrder;
 import com.dukascopy.api.IStrategy;
 import com.dukascopy.api.ITick;
 import com.dukascopy.api.Instrument;
+import com.dukascopy.api.OfferSide;
 import com.dukascopy.api.Period;
 import com.dukascopy.api.system.ClientFactory;
 import com.dukascopy.api.system.IClient;
 import com.dukascopy.api.system.ISystemListener;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.IOException;
@@ -42,6 +46,9 @@ import java.util.regex.Pattern;
  *   GET  /health                          connected, account id
  *   GET  /account                         balance, equity, currency
  *   GET  /tick?symbol=XAUUSD              last bid / ask
+ *   GET  /bars?symbol=&period=&side=&from=   closed bars (period 1min|5min|15min|30min|1h, side bid|ask)
+ *                                         opening at or after `from` (epoch ms), oldest first;
+ *                                         bars without ticks (weekends, closed market) left out
  *   POST /orders                          {label, symbol, side, qty, stop, target, min_size?}: market order
  *                                         with stop and target attached; an existing label is
  *                                         returned as is (duplicate: true), never sent twice
@@ -188,6 +195,9 @@ public final class Bridge implements IStrategy {
                     if (tick == null) throw new IllegalStateException("no tick yet for " + instrument);
                     return new JSONObject().put("bid", tick.getBid()).put("ask", tick.getAsk()).put("time", tick.getTime());
                 });
+            } else if (path[0].equals("bars")) {
+                body = bars(instrument(param(query, "symbol")), period(param(query, "period")),
+                        side(param(query, "side")), Long.parseLong(param(query, "from")));
             } else if (path[0].equals("orders") && path.length == 1 && method.equals("POST")) {
                 body = submit(new JSONObject(new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8)));
             } else if (path[0].equals("orders") && path.length == 2 && method.equals("GET")) {
@@ -265,6 +275,23 @@ public final class Bridge implements IStrategy {
         return call(() -> json(order));
     }
 
+    /** Closed bars opening at or after `from`. A history lookup, so it runs on the HTTP thread. */
+    private JSONObject bars(Instrument instrument, Period period, OfferSide side, long from) throws Exception {
+        if (context == null || !client.isConnected()) throw new IllegalStateException("not connected to Dukascopy");
+        IHistory history = context.getHistory();
+        JSONArray rows = new JSONArray();
+        IBar last = history.getBar(instrument, period, side, 1);  // shift 1: the newest closed bar
+        long start = history.getBarStart(period, from);
+        if (start < from) start += period.getInterval();
+        if (last != null && start <= last.getTime()) {
+            for (IBar b : history.getBars(instrument, period, side, Filter.ALL_FLATS, start, last.getTime())) {
+                rows.put(new JSONObject().put("time", b.getTime()).put("open", b.getOpen()).put("high", b.getHigh())
+                        .put("low", b.getLow()).put("close", b.getClose()).put("volume", b.getVolume()));
+            }
+        }
+        return new JSONObject().put("symbol", instrument.name()).put("bars", rows);
+    }
+
     /** An order by label: one this process has seen, an active one, then the account history (by its
      *  Dukascopy id when known, else by label since `since`). */
     private IOrder find(String label, Instrument instrument, String id, long since) throws Exception {
@@ -311,6 +338,25 @@ public final class Bridge implements IStrategy {
         if (i == null && symbol.length() == 6) i = Instrument.fromString(symbol.substring(0, 3) + "/" + symbol.substring(3));
         if (i == null) throw new IllegalArgumentException("unknown symbol " + symbol);
         return i;
+    }
+
+    static Period period(String name) {
+        return switch (name) {
+            case "1min" -> Period.ONE_MIN;
+            case "5min" -> Period.FIVE_MINS;
+            case "15min" -> Period.FIFTEEN_MINS;
+            case "30min" -> Period.THIRTY_MINS;
+            case "1h" -> Period.ONE_HOUR;
+            default -> throw new IllegalArgumentException("period must be 1min, 5min, 15min, 30min or 1h: " + name);
+        };
+    }
+
+    static OfferSide side(String name) {
+        return switch (name) {
+            case "bid" -> OfferSide.BID;
+            case "ask" -> OfferSide.ASK;
+            default -> throw new IllegalArgumentException("side must be bid or ask: " + name);
+        };
     }
 
     private static Map<String, String> query(String raw) {

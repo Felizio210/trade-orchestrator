@@ -10,6 +10,9 @@
     account currency.
   * balance: the account's balance, so sizing and the risk limits use the real account.
 
+  * bars: closed bars from the account's live feed (the bridge's /bars), on the side the
+    warehouse bars use (mid = the average of the bid and ask bars).
+
 realtime = True: only a signal on the newest bar is acted on (the executor skips the rest).
 """
 
@@ -85,6 +88,22 @@ class DukascopyBroker(Broker):
 
     def equity(self) -> float:
         return float(self._call("GET", "/account")["equity"])
+
+    def bars(self, symbol, timeframe, after, price_side):
+        query = {"symbol": symbol, "period": timeframe,
+                 "from": int((after + pd.Timedelta(timeframe)).timestamp() * 1000)}
+        sides = ["bid", "ask"] if price_side == "mid" else [price_side]
+        frames = []
+        for side in sides:
+            rows = self._call("GET", "/bars", side=side, **query)["bars"]
+            df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"])
+            df.insert(0, "ts", pd.to_datetime(df.pop("time"), unit="ms", utc=True))
+            frames.append(df.set_index("ts").astype(float))
+        if len(frames) == 2:  # mid: both sides' bars, averaged where both exist
+            bid, ask = frames
+            both = bid.index.intersection(ask.index)
+            frames = [((bid.loc[both] + ask.loc[both]) / 2).assign(volume=bid.loc[both, "volume"])]
+        return frames[0].reset_index()
 
     def order(self, order_id: str, symbol: str, since: pd.Timestamp | None = None,
               broker_id: str | None = None) -> dict | None:

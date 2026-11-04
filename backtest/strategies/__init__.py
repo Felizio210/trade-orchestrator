@@ -1,6 +1,7 @@
 """Strategy registry.
 
-A strategy module has DEFAULTS (every parameter with its default) and
+A strategy module has DEFAULTS (every parameter with its default), optionally
+MAX_TIMEFRAME (the slowest bars it can work on, e.g. "15min"), and
 signals(bars, **params) -> DataFrame with one row per bar:
     signal  +1 long, -1 short, 0 nothing; decided at the bar's close, filled at the next open
     stop    absolute stop price (required with a signal)
@@ -45,6 +46,13 @@ def get(name: str) -> ModuleType:
     if name not in STRATEGIES:
         raise ValueError(f"Unknown strategy {name!r}; available: {sorted(STRATEGIES)}")
     return STRATEGIES[name]
+
+
+def check_timeframe(name: str, timeframe: str) -> None:
+    """Raise if `name` can't work on `timeframe` bars (slower than its MAX_TIMEFRAME)."""
+    limit = getattr(get(name), "MAX_TIMEFRAME", None)
+    if limit and pd.Timedelta(timeframe) > pd.Timedelta(limit):
+        raise ValueError(f"{name} runs on {limit} bars or faster, not {timeframe}")
 
 
 def run(name: str, bars: pd.DataFrame, params: dict[str, Any]) -> pd.DataFrame:

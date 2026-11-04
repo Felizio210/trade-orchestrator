@@ -1,16 +1,26 @@
 """The Dukascopy broker against a fake dlh-bridge: sizing, labels, fills, exits, the account
 balance, and a trading step that only acts on the newest bar. No network."""
 
+import json
 from datetime import datetime, timezone
 
 import pandas as pd
 import pytest
 
 from backtest import strategies
-from trading import store
+from backtest.runner import setup as backtest_setup
+from backtest.config import BacktestSettings
+from cloud import Cloud, CloudSettings
+from ingestion.dukascopy.config import Settings
+from ingestion.dukascopy.pipeline import setup as market_setup
+from ingestion.dukascopy.tables import bq_table_id, shape
+from trading import executor, store
+from trading.config import TradingSettings
+from trading.gate import setup as trading_setup
 from trading.brokers.dukascopy import BridgeError, DukascopyBroker, exit_reason, label
 from trading.executor import signal_id, step
 from trading.store import Order
+from tests.test_backtest import SILVER_BULLET_5MIN, random_bars
 from tests.test_trading import NO_LIMITS, STRATEGY, after, approve, env, set_cursor  # noqa: F401 (fixture)
 
 T0 = pd.Timestamp("2026-11-03 10:00", tz="UTC")
@@ -19,8 +29,10 @@ T0 = pd.Timestamp("2026-11-03 10:00", tz="UTC")
 class FakeBridge(DukascopyBroker):
     """Answers like bridge/ does: market orders fill at once at the bid/ask, labels are unique."""
 
-    def __init__(self, bid=100.0, ask=100.2, balance=50_000.0, equity=None):
+    def __init__(self, bid=100.0, ask=100.2, balance=50_000.0, equity=None, live=None):
         super().__init__("http://bridge.test")
+        self.live = live  # {side: DataFrame of bars} served by /bars
+        self.bar_requests: list[dict] = []
         self.bid, self.ask, self.account_balance = bid, ask, balance
         self.account_equity = balance if equity is None else equity
         self.orders: dict[str, dict] = {}
@@ -29,6 +41,13 @@ class FakeBridge(DukascopyBroker):
     def _call(self, method, path, body=None, **query):
         if path == "/account":
             return {"balance": self.account_balance, "equity": self.account_equity, "currency": "USD"}
+        if path == "/bars":
+            self.bar_requests.append(query)
+            df = self.live[query["side"]]
+            df = df[df["ts"] >= pd.Timestamp(query["from"], unit="ms", tz="UTC")]
+            return {"symbol": query["symbol"], "bars": [
+                {"time": int(r.ts.timestamp() * 1000), "open": r.open, "high": r.high, "low": r.low,
+                 "close": r.close, "volume": r.volume} for r in df.itertuples()]}
         if path == "/tick":
             return {"bid": self.bid, "ask": self.ask, "time": int(T0.timestamp() * 1000)}
         if method == "POST" and path == "/orders":
@@ -163,3 +182,103 @@ def test_account_snapshot_records_the_brokers_equity(env):
     [row] = store.read(cloud, "trading", "account").itertuples()
     assert (row.balance, row.equity) == (10_000.0, 9_999.56)
     assert result["equity"] == 9_999.56
+
+
+# --- live bars ---
+
+def test_bars_come_back_as_a_frame_and_mid_averages_both_sides():
+    ts = pd.date_range("2026-11-03 10:00", periods=3, freq="5min", tz="UTC")
+    bid = pd.DataFrame({"ts": ts, "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 3.0})
+    ask = bid.assign(open=1.2, high=2.2, low=0.7, close=1.7).iloc[1:]  # ask lacks the first bar
+    bridge = FakeBridge(live={"bid": bid, "ask": ask})
+    got = bridge.bars("XAUUSD", "5min", ts[0], "bid")
+    assert got["ts"].tolist() == list(ts[1:])  # opening after `after`
+    assert bridge.bar_requests[0] == {"side": "bid", "symbol": "XAUUSD", "period": "5min",
+                                      "from": int(ts[1].timestamp() * 1000)}
+    mid = bridge.bars("XAUUSD", "5min", ts[0] - pd.Timedelta("5min"), "mid")
+    assert mid["ts"].tolist() == list(ts[1:])  # only where both sides have the bar
+    assert mid[["open", "high", "low", "close", "volume"]].iloc[0].tolist() == pytest.approx([1.1, 2.1, 0.6, 1.6, 3.0])
+
+
+@pytest.fixture
+def env5(tmp_path):
+    """5min XAUUSD bars, with a silver_bullet approval that signals on most hours."""
+    cloud = Cloud(CloudSettings(env="local", local_dir=str(tmp_path / ".local_gcp")))
+    market = Settings(local_data_dir=str(tmp_path / "data"), datasets=["bars"], bar_timeframes=["5min"])
+    market_setup(market, cloud)
+    backtest = BacktestSettings()
+    backtest_setup(backtest, cloud)
+    trading_setup(TradingSettings(), cloud)
+    bars = random_bars(n=12 * 24 * 6, freq="5min")
+    params = strategies.resolve_params("silver_bullet", SILVER_BULLET_5MIN)
+    sig = strategies.run("silver_bullet", bars, params)
+    store.write(cloud, "trading", "approvals", [{
+        "strategy": "silver_bullet", "timeframe": "5min", "symbol": "XAUUSD", "status": "approved",
+        "run_id": "daily-x", "params_json": json.dumps(params), "decided_at": bars["ts"].iloc[-1]}])
+    return cloud, market, backtest, bars, sig
+
+
+def to_warehouse(cloud, bars):
+    bars = bars.assign(date=bars["ts"].dt.date)
+    for day, df in bars.groupby("date"):
+        shaped = shape(df.drop(columns="date"), "bars", "XAUUSD", day, pd.Timestamp.now(tz="UTC"),
+                       timeframe="5min", price_side="bid")
+        cloud.bq.replace_from_dataframe(shaped, bq_table_id("market", "bars_5min"), {"symbol": "XAUUSD", "date": day})
+
+
+def test_5min_signal_is_ordered_from_the_bridge_before_the_warehouse_has_its_hour(env5):
+    cloud, market, backtest, bars, sig = env5
+    hit = sig.index[(sig["signal"] != 0) & (sig.index > 12 * 24 * 3)][0]
+    # The hourly load has the warehouse up to 40 minutes before the signal bar; the bridge has the rest
+    to_warehouse(cloud, bars.iloc[:hit - 7])
+    close = float(bars["close"].iloc[hit])
+    bridge = FakeBridge(bid=close, ask=close, live={"bid": bars.iloc[:hit + 1]})
+    store.write(cloud, "trading", "cursors", [{"timeframe": "5min", "symbol": "XAUUSD",
+                                               "last_bar_ts": bars["ts"].iloc[hit - 1], "updated_at": T0}])
+    now = bars["ts"].iloc[hit] + pd.Timedelta("5min") + pd.Timedelta("30s")  # the minute the bar closed
+    result = step(NO_LIMITS, backtest, market, cloud, broker=bridge, now=now)
+
+    assert bridge.bar_requests[0]["from"] == int(bars["ts"].iloc[hit - 7].timestamp() * 1000)
+    assert result["bars"] == 1 and result["ordered"] == 1
+    [row] = store.read(cloud, "trading", "signals").itertuples()
+    assert row.signal_id == signal_id("silver_bullet", "5min", "XAUUSD", bars["ts"].iloc[hit])
+    assert (row.status, row.side) == ("ordered", "long" if sig["signal"][hit] > 0 else "short")
+    assert row.stop == pytest.approx(sig["stop"][hit])  # the signal the backtest computes on the full bars
+
+
+def test_step_skips_a_timeframe_whose_next_bar_has_not_closed(env5, monkeypatch):
+    cloud, market, backtest, bars, _sig = env5
+    to_warehouse(cloud, bars)
+    last = bars["ts"].iloc[-1]
+    store.write(cloud, "trading", "cursors", [{"timeframe": "5min", "symbol": "XAUUSD",
+                                               "last_bar_ts": last, "updated_at": T0}])
+    loads = []
+    monkeypatch.setattr(executor, "load_bars", lambda *a, **k: loads.append(a) or bars)
+    bridge = FakeBridge(live={"bid": bars})
+    # One minute after the newest bar closed, the next one is 4 minutes away: no query at all
+    result = step(NO_LIMITS, backtest, market, cloud, broker=bridge, now=last + pd.Timedelta("6min"))
+    assert result["bars"] == 0 and loads == [] and bridge.bar_requests == []
+
+
+def test_on_the_5_minute_schedule_15min_bars_are_pulled_every_third_run(env5, monkeypatch):
+    cloud, market, backtest, _bars, _sig = env5
+    bars = random_bars(n=4 * 24 * 6, freq="15min").assign(price_side="bid", ingested_at=T0)
+    five = _bars.assign(price_side="bid", ingested_at=T0)
+    cursor = bars["ts"].iloc[-2]  # the bar before the newest; the newest closes at last + 15min
+    store.write(cloud, "trading", "approvals", [{
+        "strategy": "supply_demand", "timeframe": "15min", "symbol": "XAUUSD", "status": "approved",
+        "run_id": "daily-x", "params_json": json.dumps(strategies.resolve_params("supply_demand")),
+        "decided_at": bars["ts"].iloc[-1]}])
+    loads = []
+    monkeypatch.setattr(executor, "load_bars",
+                        lambda cloud_, market_, sym, tf, *a: loads.append(tf) or (bars if tf == "15min" else five))
+    pulled = []
+    for minute in (1, 6, 11, 16):  # the runs of 1-59/5 after the cursor bar closed
+        store.write(cloud, "trading", "cursors", [{"timeframe": "15min", "symbol": "XAUUSD",
+                                                   "last_bar_ts": cursor, "updated_at": T0}])
+        loads.clear()
+        now = cursor + pd.Timedelta("15min") + pd.Timedelta(minutes=minute)
+        step(NO_LIMITS, backtest, market, cloud, broker=FakeBridge(live={"bid": bars}), now=now)
+        pulled.append("15min" in loads)
+    # The bar after the cursor closes at +30min: only the run at :16 past it (+31min) pulls it
+    assert pulled == [False, False, False, True]
