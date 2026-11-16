@@ -95,7 +95,10 @@ def _send(channel: str, subject: str, text: str) -> None:
             if port != 25:
                 smtp.starttls()
             if env("ALERT_SMTP_USER"):
-                smtp.login(env("ALERT_SMTP_USER"), env("ALERT_SMTP_PASSWORD") or "")
+                if not env("ALERT_SMTP_PASSWORD"):
+                    raise ValueError("ALERT_SMTP_PASSWORD is empty (Gmail: an App Password from "
+                                     "https://myaccount.google.com/apppasswords)")
+                smtp.login(env("ALERT_SMTP_USER"), env("ALERT_SMTP_PASSWORD"))
             smtp.send_message(msg)
 
 
