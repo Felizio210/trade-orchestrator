@@ -3,7 +3,8 @@
 For each (strategy, timeframe, symbol), the newest done run whose run_id starts with
 TRADING_RUN_PREFIX ("daily-") is checked against the TRADING_MIN_* / TRADING_MAX_*
 thresholds. A pass is stored as approved together with that run's exact parameters, so
-trading never uses parameters that weren't backtested. Every failed check is written to
+trading never uses parameters that weren't backtested. A newest run older than
+TRADING_APPROVAL_MAX_AGE_DAYS is rejected: the strategy is no longer being backtested. Every failed check is written to
 `reasons`. A strategy that was approved and now fails is revoked: it opens no new
 positions, and its open ones run to their stop or target. Timeframes faster than
 MIN_TIMEFRAME (5min, trading_live's schedule) are always rejected, whatever their metrics.
@@ -89,8 +90,10 @@ def latest_metrics(settings: TradingSettings, backtest: BacktestSettings, cloud:
     if df.empty:
         return df
     df["created_at"] = pd.to_datetime(df["created_at"], utc=True)
-    return (df.sort_values("created_at").groupby(["strategy", "timeframe", "symbol"], as_index=False).last()
-            .reset_index(drop=True))
+    # The newest run's whole row. Not groupby().last(): that takes the last non-null value of
+    # each column, so a metric the newest run left empty would be filled in from an older run.
+    return (df.sort_values("created_at").drop_duplicates(["strategy", "timeframe", "symbol"], keep="last")
+            .sort_values(["strategy", "timeframe", "symbol"]).reset_index(drop=True))
 
 
 def evaluate(settings: TradingSettings, backtest: BacktestSettings, cloud: Cloud,
@@ -105,6 +108,11 @@ def evaluate(settings: TradingSettings, backtest: BacktestSettings, cloud: Cloud
     for m in latest.to_dict("records"):
         m = {k: store.clean(v) for k, v in m.items()}
         reasons = check(m, settings)
+        age = pd.Timestamp(now) - m["created_at"]
+        if age > pd.Timedelta(days=settings.approval_max_age_days):
+            # e.g. dropped from BACKTEST_DAILY_RUNS: without this its last run would be re-approved,
+            # with a fresh decided_at, after every other strategy's backtest, for good
+            reasons.append(f"latest backtest is {age.days} days old (max {settings.approval_max_age_days:g})")
         if pd.Timedelta(m["timeframe"]) < pd.Timedelta(MIN_TIMEFRAME):
             reasons.append(f"{m['timeframe']} is faster than trading_live's {MIN_TIMEFRAME} schedule")
         key = (m["strategy"], m["timeframe"], m["symbol"])

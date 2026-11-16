@@ -8,7 +8,8 @@ replaces. dukascopy_repair (09:00) fills anything finalize missed.
 
 intraday runs whatever finalize did, so trading never waits on yesterday; a failed finalize
 or load still marks the run failed. freshness fails the run when the newest bars are too old,
-so a stalled feed shows up as a failed task. Emits the hourly bars Dataset, which triggers trading_live.
+so a stalled feed shows up as a failed task. Emits the hourly bars Dataset once today's bars
+are loaded; nothing is scheduled on it now (trading_live runs on its own 5-minute cron).
 """
 
 from datetime import timedelta

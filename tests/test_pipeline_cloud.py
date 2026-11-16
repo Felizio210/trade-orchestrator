@@ -398,10 +398,110 @@ def test_freshness_ignores_closed_market_hours(tmp_path, monkeypatch):
     from datetime import datetime, timezone
 
     dlh_tasks, settings, cloud, fetched = _tasks(tmp_path, monkeypatch)
-    # Friday's last open hour is 20h; the market reopens Sunday 22:00
+    # Friday's last open hour is 20h; New York's clocks go back on Sunday Nov 1, so the market
+    # reopens at 23:00 UTC that day, not 22:00
     dlh_tasks.intraday(data_interval_end=datetime(2026, 10, 30, 21, 10, tzinfo=timezone.utc))
     weekend = dlh_tasks.freshness(data_interval_end=datetime(2026, 11, 1, 23, 10, tzinfo=timezone.utc))
-    assert weekend["EURUSD 1h"].endswith("(1h behind)")  # only Sunday 22h counts
+    assert weekend["EURUSD 1h"].endswith("(0h behind)")
+    monday = dlh_tasks.freshness(data_interval_end=datetime(2026, 11, 2, 1, 10, tzinfo=timezone.utc))
+    assert monday["EURUSD 1h"].endswith("(2h behind)")  # Sunday 23h and Monday 00h
+
+
+def test_market_hours_follow_new_york_time():
+    """The daily break and the weekend move by an hour in UTC with US daylight saving."""
+    import sys
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "airflow" / "plugins"))
+    from dlh_tasks import _market_open
+
+    def is_open(*args):
+        return _market_open(datetime(*args, tzinfo=timezone.utc))
+
+    # summer (Wed 2026-07-08): the break is 21:00 UTC
+    assert [is_open(2026, 7, 8, h) for h in (20, 21, 22)] == [True, False, True]
+    # winter (Wed 2026-11-04): the break is 22:00 UTC
+    assert [is_open(2026, 11, 4, h) for h in (21, 22, 23)] == [True, False, True]
+    # weekend: closes Friday 17:00 New York, reopens Sunday 18:00
+    assert [is_open(2026, 7, 10, h) for h in (20, 21)] == [True, False]  # summer Friday
+    assert [is_open(2026, 11, 6, h) for h in (21, 22)] == [True, False]  # winter Friday
+    assert not is_open(2026, 11, 7, 12)  # Saturday
+    assert [is_open(2026, 7, 12, h) for h in (21, 22)] == [False, True]  # summer Sunday
+    assert [is_open(2026, 11, 8, h) for h in (22, 23)] == [False, True]  # winter Sunday
+    # Christmas, New Year's Day and Good Friday don't trade at all
+    assert not is_open(2026, 12, 25, 10) and not is_open(2027, 1, 1, 10) and not is_open(2026, 4, 3, 10)
+    assert is_open(2026, 12, 24, 10) and is_open(2026, 12, 28, 10)
+
+
+def test_finalize_waits_for_the_last_hour_before_publishing(tmp_path, monkeypatch):
+    """At 00:10 yesterday's 23h may not be out yet; publishing then would keep the day short for good."""
+    from datetime import datetime, timezone
+
+    dlh_tasks, settings, cloud, fetched = _tasks(tmp_path, monkeypatch)
+    blob = make_bi5([(0, 117012, 117010, 1.0, 1.0)])
+    late = {23}
+    monkeypatch.setattr(DukascopyClient, "fetch_hour_raw",
+                        lambda self, symbol, hour: b"" if hour.hour in late else blob)
+    uri = lake_uri(settings, "bars_1h", "EURUSD", date(2026, 10, 29))  # a Thursday
+
+    with pytest.raises(RuntimeError, match="EURUSD: 23h not published yet"):
+        dlh_tasks.finalize(data_interval_end=datetime(2026, 10, 30, 0, 10, tzinfo=timezone.utc))
+    assert not cloud.storage.exists(uri)
+
+    late.clear()  # the hour arrives: the next hourly run publishes the whole day
+    dlh_tasks.finalize(data_interval_end=datetime(2026, 10, 30, 1, 10, tzinfo=timezone.utc))
+    assert dlh_tasks.load()["loaded"] == 2
+    assert len(cloud.bq.query("SELECT ts FROM market_1h.dukascopy_bars")) == 24
+
+
+def test_finalize_accepts_an_empty_last_hour_when_it_is_closed_or_stays_empty(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+
+    dlh_tasks, settings, cloud, fetched = _tasks(tmp_path, monkeypatch)
+    blob = make_bi5([(0, 117012, 117010, 1.0, 1.0)])
+    monkeypatch.setattr(DukascopyClient, "fetch_hour_raw",
+                        lambda self, symbol, hour: b"" if hour.hour >= 21 else blob)
+    # Friday: 23h is after the weekly close, nothing to wait for
+    result = dlh_tasks.finalize(data_interval_end=datetime(2026, 10, 31, 0, 10, tzinfo=timezone.utc))
+    assert result["published"] == ["EURUSD"]
+    # Thursday, still empty a few hours later (e.g. a holiday evening): published as it is
+    with pytest.raises(RuntimeError, match="23h not published yet"):
+        dlh_tasks.finalize(data_interval_end=datetime(2026, 10, 30, 2, 10, tzinfo=timezone.utc))
+    result = dlh_tasks.finalize(data_interval_end=datetime(2026, 10, 30, 3, 10, tzinfo=timezone.utc))
+    assert result["published"] == ["EURUSD"]
+
+
+def test_repair_reaches_back_to_the_last_published_day_after_long_downtime(tmp_path, monkeypatch):
+    """Downtime longer than DUKASCOPY_REPAIR_DAYS must not leave a hole behind the window."""
+    import sys
+    from pathlib import Path
+
+    from ingestion.dukascopy import pipeline
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "airflow" / "plugins"))
+    import dlh_tasks
+
+    settings = Settings(local_data_dir=str(tmp_path / "data"), symbols=["EURUSD"])
+    cloud = Cloud(CloudSettings(env="local", local_dir=str(tmp_path / ".local_gcp")))
+    setup(settings, cloud)
+    monkeypatch.setattr(dlh_tasks, "_pipeline", lambda: (pipeline, settings, cloud))
+    monkeypatch.setenv("DUKASCOPY_REPAIR_DAYS", "3")
+    monkeypatch.setattr(DukascopyClient, "fetch_hour_raw",
+                        lambda self, symbol, hour: BLOB if hour.hour == 10 else b"")
+
+    # A new install has nothing published: the window stays as configured
+    assert pipeline.repair_start(["EURUSD"], date(2026, 9, 14), settings, cloud) == date(2026, 9, 14)
+
+    backfill_range(["EURUSD"], date(2026, 9, 1), date(2026, 9, 2), settings, cloud)  # last days before the outage
+    result = dlh_tasks.repair(ds="2026-09-16")  # two weeks later; the window alone is 09-14 .. 09-16
+    assert result["start"] == "2026-09-03"
+    assert len(result["published"]) == 12  # 09-03 .. 09-16 without the two Saturdays
+    days = cloud.bq.query("SELECT DISTINCT date FROM market_1h.dukascopy_bars ORDER BY date")["date"].tolist()
+    assert days[0] == "2026-09-01" and len(days) == 14
+
+    monkeypatch.setenv("DUKASCOPY_REPAIR_MAX_DAYS", "5")  # the cap: older gaps stay manual
+    assert dlh_tasks.repair(ds="2026-10-16")["start"] == "2026-10-14"
 
 
 def test_freshness_fails_when_a_symbol_has_no_bars(tmp_path, monkeypatch):

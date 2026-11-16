@@ -45,6 +45,9 @@ def setup(**_) -> list[str]:
     return pipeline.setup(settings, cloud)
 
 
+FINALIZE_WAIT_HOURS = 3  # how long finalize waits for yesterday's last hour before accepting it as empty
+
+
 def finalize(data_interval_end, **_) -> dict:
     """Publish the last complete UTC day (yesterday) to the lake and Pub/Sub, once.
 
@@ -56,7 +59,7 @@ def finalize(data_interval_end, **_) -> dict:
     Incomplete days are not published and the task fails, without retries: the next hourly
     run tries again, and dukascopy_repair covers anything older.
     """
-    from datetime import timedelta
+    from datetime import datetime, time, timedelta, timezone
 
     pipeline, settings, cloud = _pipeline()
     settings = _ticks(settings)
@@ -77,6 +80,15 @@ def finalize(data_interval_end, **_) -> dict:
         manifest = download_day(symbol, day, settings, client=client)
         if problems(manifest):
             incomplete.append(f"{symbol}: {problem_summary(manifest)}")
+            continue
+        # Dukascopy publishes an hour a few minutes after it ends, and an hour that isn't there
+        # yet downloads as empty. Once the day is in the lake nothing fetches it again, so in the
+        # first hours after midnight an empty last hour (market open) means "wait", not "publish".
+        last = manifest["hours"][-1]
+        last_hour = datetime.combine(day, time(23), tzinfo=timezone.utc)
+        if (last["status"] == "empty" and _market_open(last_hour)
+                and data_interval_end - last_hour < timedelta(hours=FINALIZE_WAIT_HOURS + 1)):
+            incomplete.append(f"{symbol}: 23h not published yet")
             continue
         pipeline.publish_day(symbol, day, settings, cloud)
         published.append(symbol)
@@ -101,6 +113,10 @@ def repair(ds: str, **_) -> dict:
     downtime) or Dukascopy stayed incomplete. Days already in the lake are skipped, so a
     quiet day costs a few lookups. Days still incomplete fail the task at the end so
     Airflow retries them.
+
+    After downtime longer than the window, the window is stretched back to the newest day
+    already in the lake (at most DUKASCOPY_REPAIR_MAX_DAYS, default 60), so the days in
+    between are filled too instead of staying a hole that backtests would run over.
     """
     from datetime import timedelta
 
@@ -108,6 +124,8 @@ def repair(ds: str, **_) -> dict:
     settings = _ticks(settings)
     end = min(date.fromisoformat(ds), pipeline.last_complete_day())  # a manual run's ds is today
     start = end - timedelta(days=int(os.environ.get("DUKASCOPY_REPAIR_DAYS", "7")) - 1)
+    start = pipeline.repair_start(settings.symbols, start, settings, cloud,
+                                  max_days=int(os.environ.get("DUKASCOPY_REPAIR_MAX_DAYS", "60")))
     result = pipeline.backfill_range(settings.symbols, start, end, settings, cloud)
     summary = {"start": start.isoformat(), "end": end.isoformat(), "existing": result["existing"],
                "published": [f"{p['symbol']} {p['date']}" for p in result["published"]],
@@ -121,11 +139,24 @@ def repair(ds: str, **_) -> dict:
 
 
 def _market_open(hour) -> bool:
-    """Rough FX/metals hours: closed Friday 21:00 to Sunday 22:00 UTC, and the daily 21:00
-    rollover hour (gold has no ticks then). Only decides whether an empty hour is worth a retry."""
-    weekday = hour.weekday()
-    return not (weekday == 5 or (weekday == 4 and hour.hour >= 21) or (weekday == 6 and hour.hour < 22)
-                or hour.hour == 21)
+    """Rough FX/metals hours, which follow New York time: closed Friday 17:00 to Sunday 18:00,
+    and the daily 17:00 rollover hour (gold has no ticks then). In UTC that is 21:00/22:00 in
+    summer and 22:00/23:00 in winter, so the hour is converted rather than compared in UTC.
+    The sessions of Christmas, New Year's Day and Good Friday (18:00 the evening before to
+    17:00) don't trade at all. Shortened sessions around other US holidays are not modelled.
+    Only decides whether an empty hour is worth a retry."""
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+
+    from dateutil.easter import easter
+
+    ny = hour.astimezone(ZoneInfo("America/New_York"))
+    weekday = ny.weekday()
+    if weekday == 5 or (weekday == 4 and ny.hour >= 17) or (weekday == 6 and ny.hour < 18) or ny.hour == 17:
+        return False
+    session = (ny + timedelta(hours=6)).date()  # a session starts at 18:00 the evening before
+    return not ((session.month, session.day) in ((12, 25), (1, 1))
+                or session == easter(session.year) - timedelta(days=2))
 
 
 def freshness(data_interval_end, **_) -> dict:

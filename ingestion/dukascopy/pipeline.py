@@ -317,6 +317,24 @@ def run_range(
     return result
 
 
+def repair_start(symbols: list[str], start: date, settings: Settings, cloud: Cloud, *, max_days: int = 60) -> date:
+    """Where a gap repair that would begin on `start` should really begin.
+
+    Walks back from `start` to the newest day that is fully in the lake and returns the day
+    after it, so downtime longer than the repair window doesn't leave a hole behind it.
+    Looks at most `max_days` back; if nothing is published in that span (a new install, or a
+    symbol just added) `start` is returned unchanged and long backfills stay manual.
+    """
+    datasets = _dataset_names(settings)
+    day = start - timedelta(days=1)
+    while day >= start - timedelta(days=max_days):
+        if day.weekday() != 5 and all(cloud.storage.exists(lake_uri(settings, ds, symbol.upper(), day))
+                                      for symbol in symbols for ds in datasets):
+            return min(start, day + timedelta(days=1))
+        day -= timedelta(days=1)
+    return start
+
+
 def backfill_range(
     symbols: list[str],
     start: date,

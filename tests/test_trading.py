@@ -121,6 +121,23 @@ def test_gate_approves_revokes_and_ignores_adhoc_runs(env):
     assert events["kind"].tolist() == ["approved", "revoked"]
 
 
+def test_gate_judges_only_the_newest_run_and_rejects_it_when_stale(env):
+    cloud, _market, backtest, _bars = env
+    settings, t0 = TradingSettings(min_sharpe=None), datetime(2026, 10, 1, tzinfo=timezone.utc)
+    write_metrics(cloud, "daily-a", t0, avg_r=0.5)
+    # The newest run has no avg_r: it must not be filled in from the older run
+    write_metrics(cloud, "daily-b", t0 + timedelta(days=1), avg_r=None)
+    [row] = evaluate(settings, backtest, cloud, now=t0 + timedelta(days=1))
+    assert (row["run_id"], row["status"], row["reasons"]) == ("daily-b", "rejected", "avg_r missing")
+
+    # No longer backtested (e.g. dropped from BACKTEST_DAILY_RUNS): its last run can't keep approving it
+    write_metrics(cloud, "daily-c", t0 + timedelta(days=2))
+    [row] = evaluate(settings, backtest, cloud, now=t0 + timedelta(days=2))
+    assert row["status"] == "approved"
+    [row] = evaluate(settings, backtest, cloud, now=t0 + timedelta(days=12))
+    assert (row["status"], row["reasons"]) == ("rejected", "latest backtest is 10 days old (max 3)")
+
+
 def test_gate_rejects_timeframes_faster_than_the_trading_schedule(env):
     cloud, _market, backtest, _bars = env
     t0 = datetime(2026, 10, 1, tzinfo=timezone.utc)
