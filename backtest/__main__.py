@@ -4,7 +4,9 @@
     python -m backtest strategies                # strategies and their parameters
     python -m backtest run --strategy supply_demand --symbols EURUSD,XAUUSD --timeframe 1h \\
         --start 2025-01-01 --end 2026-09-30 --param rr=2.5 --param base_max=2
+    python -m backtest run ... --walk-forward    # choose parameters out of sample (strategy GRID)
     python -m backtest list                      # latest runs with their results
+    python -m backtest prune                     # thin old equity curves to one row per day
 """
 
 from __future__ import annotations
@@ -53,6 +55,10 @@ def main(argv: list[str] | None = None) -> None:
     p_run.add_argument("--param", action="append", default=[], metavar="KEY=VALUE",
                        help="Override a strategy parameter; repeat for more")
     p_run.add_argument("--run-id", help="Re-run under an existing run_id (replaces its results)")
+    p_run.add_argument("--walk-forward", action=argparse.BooleanOptionalAction, default=None,
+                       help="Choose parameters on rolling training windows and store only the out-of-sample "
+                            "periods (default BACKTEST_WALK_FORWARD)")
+    sub.add_parser("prune", help="Thin old equity curves to one row per day")
 
     p_list = sub.add_parser("list", help="Latest runs with their results")
     p_list.add_argument("--limit", type=int, default=20)
@@ -77,16 +83,22 @@ def main(argv: list[str] | None = None) -> None:
         symbols = _csv(args.symbols) if args.symbols else market.symbols
         try:
             result = run(args.strategy, symbols, args.timeframe, args.start, args.end, settings, market, cloud,
-                         params=_params(args.param), run_id=args.run_id)
+                         params=_params(args.param), run_id=args.run_id, walk_forward_mode=args.walk_forward)
         except ValueError as exc:
             print(f"error: {exc}")
             sys.exit(2)
-        print(f"\nrun_id {result['run_id']}")
-        print(f"{'SYMBOL':<10} {'TRADES':>6} {'RETURN':>9} {'MAX DD':>9} {'SHARPE':>7} {'WIN':>8} {'PF':>6} {'AVG R':>6}")
-        for m in result["metrics"]:
-            print(f"{m['symbol']:<10} {m['n_trades']:>6} {_fmt(m['total_return'], True):>9} "
+        print(f"\nrun_id {result['run_id']} ({result['mode']}, params {result['params']})")
+        print(f"{'SYMBOL SCOPE':<16} {'TRADES':>6} {'RETURN':>9} {'MAX DD':>9} {'SHARPE':>7} {'WIN':>8} {'PF':>6} {'AVG R':>6}")
+        for m in result["metrics"] + result["recent"]:
+            print(f"{m['symbol'] + ' ' + m['scope']:<16} {m['n_trades']:>6} {_fmt(m['total_return'], True):>9} "
                   f"{_fmt(m['max_drawdown'], True):>9} {_fmt(m['sharpe']):>7} {_fmt(m['win_rate'], True):>8} "
                   f"{_fmt(m['profit_factor']):>6} {_fmt(m['avg_r']):>6}")
+
+    elif args.cmd == "prune":
+        from backtest.runner import prune_equity
+
+        removed = prune_equity(settings, cloud)
+        print(f"thinned {len(removed)} runs, {sum(removed.values())} equity rows removed")
 
     elif args.cmd == "list":
         runs = table_id(settings.dataset, "runs")
@@ -94,7 +106,7 @@ def main(argv: list[str] | None = None) -> None:
         df = cloud.bq.query(
             f"SELECT r.run_id, r.status, r.timeframe, r.start_date, r.end_date, m.symbol, m.n_trades, "
             f"m.total_return, m.max_drawdown, m.sharpe FROM `{runs}` r "
-            f"LEFT JOIN `{metrics}` m ON m.run_id = r.run_id "
+            f"LEFT JOIN `{metrics}` m ON m.run_id = r.run_id AND (m.scope IS NULL OR m.scope <> 'recent') "
             f"WHERE r.run_id IN (SELECT run_id FROM `{runs}` ORDER BY created_at DESC LIMIT @limit) "
             "ORDER BY r.created_at DESC, m.symbol",
             {"limit": args.limit},

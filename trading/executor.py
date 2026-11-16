@@ -42,6 +42,7 @@ from backtest.config import BacktestSettings
 from backtest.data import load_bars
 from cloud import Cloud
 from ingestion.dukascopy.config import Settings
+from ops import alerts
 from trading import brokers, risk, store
 from trading.brokers.base import Broker
 from trading.config import MIN_TIMEFRAME, TradingSettings
@@ -51,8 +52,21 @@ from trading.tables import table_id
 log = logging.getLogger(__name__)
 
 KILL_SWITCH = "kill_switch"
-# Timeframes faster than this also take the broker's live bars; slower ones use the warehouse only
-LIVE_BARS_BELOW = pd.Timedelta("1h")
+BROKER_STATUS = "broker_status"  # controls row: "down since ...: reason" while the broker is unreachable
+# Timeframes up to this also take the broker's live bars: the warehouse gets bars only once an hour
+# (dukascopy_hourly at :10), so even a 1h signal would otherwise be ordered ~15 minutes late
+LIVE_BARS_UP_TO = pd.Timedelta("1h")
+
+
+@dataclass
+class External:
+    """A position open at the broker that this system didn't open (by hand, or an order whose
+    step died before recording it). It counts toward the risk limits."""
+
+    label: str
+    symbol: str
+    side: str
+    risk: float
 
 
 def signal_id(strategy: str, timeframe: str, symbol: str, bar_ts: pd.Timestamp) -> str:
@@ -75,6 +89,7 @@ class Book:
     positions: list[Position]  # open ones, plus those closed since the first day being processed
     dirty: dict[str, Order | Position] = field(default_factory=dict)
     account_balance: float | None = None  # the broker's, when it holds the account
+    external: list[External] = field(default_factory=list)
 
     def balance(self) -> float:
         if self.account_balance is not None:
@@ -86,6 +101,14 @@ class Book:
     def live(self) -> list[Order | Position]:
         return ([o for o in self.orders if o.status == "pending"]
                 + [p for p in self.positions if p.status == "open"])
+
+    def exposure(self) -> list[Order | Position | External]:
+        """Everything that carries risk: our pending orders and open positions, and external positions."""
+        return [*self.live(), *self.external]
+
+    def symbol_risk(self, symbol: str, side: str) -> float:
+        """Risk already on `symbol` in the same direction (opposite positions offset, so they don't add)."""
+        return sum(r.risk for r in self.exposure() if r.symbol == symbol and r.side == side)
 
     def busy(self, strategy: str, timeframe: str, symbol: str) -> bool:
         return any((r.strategy, r.timeframe, r.symbol) == (strategy, timeframe, symbol) for r in self.live())
@@ -114,6 +137,26 @@ def step(settings: TradingSettings, backtest: BacktestSettings, market: Settings
                        "kind": kind, "ref": ref, "message": message})
         log.info("%s %s: %s", kind, ref, message)
 
+    # 0. The broker: while it's down, skip the step (once-per-outage alert) instead of failing every run.
+    # Positions at the broker keep their stops and targets, which the broker holds.
+    controls = store.read(cloud, ds, "controls")
+    broker_was_down = _control(controls, BROKER_STATUS)
+    problem = broker.health()
+    if problem:
+        if not broker_was_down:
+            message = f"down since {now:%Y-%m-%d %H:%M} UTC: {problem}"
+            store.write(cloud, ds, "controls", [{"key": BROKER_STATUS, "value": message, "updated_at": now}])
+            event("broker_down", broker.name, problem, key=f"{broker.name}:{now:%Y%m%dT%H%M}")
+            store.write(cloud, ds, "events", events)
+            alerts.notify(f"DLH broker {broker.name} is down", f"{problem}\nTrading is paused until it is back.",
+                          key=f"broker_down:{broker.name}")
+        log.warning("broker %s unreachable, step skipped: %s", broker.name, problem)
+        return {**counts, "broker": "down", "reason": problem}
+    if broker_was_down:
+        store.write(cloud, ds, "controls", [{"key": BROKER_STATUS, "value": None, "updated_at": now}])
+        event("broker_up", broker.name, f"back after: {broker_was_down}", key=f"{broker.name}:{now:%Y%m%dT%H%M}")
+        alerts.notify(f"DLH broker {broker.name} is back", f"was {broker_was_down}", key=f"broker_up:{broker.name}")
+
     # 1. State
     approvals = store.read(cloud, ds, "approvals", "status = 'approved'")
     fresh = approvals["decided_at"] >= now - timedelta(days=settings.approval_max_age_days)
@@ -130,10 +173,9 @@ def step(settings: TradingSettings, backtest: BacktestSettings, market: Settings
         {"since": since})["pnl"].iloc[0]
     book = Book(settings.paper_capital, float(store.clean(realized) or 0.0), orders, positions,
                 account_balance=broker.balance())
-    controls = store.read(cloud, ds, "controls")
-    kill = controls.loc[controls["key"] == KILL_SWITCH, "value"].dropna()
-    kill_reason = kill.iloc[0] if len(kill) and kill.iloc[0] else None
+    kill_reason = _control(controls, KILL_SWITCH)
     kill_was_on = kill_reason is not None
+    book.external = _reconcile(broker, book, backtest, event, now)
 
     # 2. Strategies that lost their approval open nothing new
     for order in book.orders:
@@ -154,7 +196,7 @@ def step(settings: TradingSettings, backtest: BacktestSettings, market: Settings
             continue  # the bar after the cursor hasn't closed: nothing new, skip the warehouse query
         start = (cursor if cursor is not None else now) - timedelta(days=settings.warmup_days)
         bars = load_bars(cloud, market, sym, tf, start.date(), now.date())
-        if span < LIVE_BARS_BELOW:
+        if span <= LIVE_BARS_UP_TO:
             bars = _with_live_bars(bars, broker, sym, tf, start, now, market.bar_price_side)
         bars = bars[bars["ts"] + span <= now].reset_index(drop=True)  # closed bars only
         if bars.empty:
@@ -221,14 +263,43 @@ def step(settings: TradingSettings, backtest: BacktestSettings, market: Settings
     if equity is None:
         equity = balance + sum(broker.unrealized(p, marks[(p.timeframe, p.symbol)])
                                for p in open_positions if (p.timeframe, p.symbol) in marks)
-    open_risk = sum(r.risk for r in book.live())
+    open_risk = sum(r.risk for r in book.exposure())
     store.write(cloud, ds, "account", [{
         "ts": now, "date": now.date(), "broker": broker.name, "balance": balance, "equity": equity,
         "open_positions": len(open_positions), "open_risk": open_risk, "kill_switch": kill_reason is not None,
     }])
     store.write(cloud, ds, "events", list({e["event_id"]: e for e in events}.values()))
     return {**counts, "balance": balance, "equity": equity, "open_positions": len(open_positions),
-            "pending_orders": sum(o.status == "pending" for o in book.orders), "kill_switch": kill_reason}
+            "pending_orders": sum(o.status == "pending" for o in book.orders), "kill_switch": kill_reason,
+            "external_positions": len(book.external)}
+
+
+def _control(controls: pd.DataFrame, key: str) -> str | None:
+    value = controls.loc[controls["key"] == key, "value"].dropna()
+    return value.iloc[0] if len(value) and value.iloc[0] else None
+
+
+def _reconcile(broker: Broker, book: Book, backtest: BacktestSettings, event, now) -> list[External]:
+    """Positions open at the broker that aren't ours: recorded once as an event and alerted, and
+    counted in the risk limits. Without a stop their risk can't be measured, so each counts as one
+    trade's risk (BACKTEST_RISK_PER_TRADE of the balance)."""
+    remote = broker.open_positions()
+    if remote is None:
+        return []
+    ours = {broker.label_for(r.order_id if isinstance(r, Order) else r.position_id) for r in book.live()}
+    external = []
+    for p in remote:
+        if p["label"] in ours:
+            continue
+        qty, price, stop = float(p["qty"]), float(p["open_price"]), float(p.get("stop") or 0)
+        risk = abs(price - stop) * qty if stop else book.balance() * backtest.risk_per_trade
+        external.append(External(p["label"], p["symbol"].replace("/", "").upper(), p["side"], risk))
+        message = (f"{p['side']} {qty:g} {p['symbol']} at {price:g}, "
+                   + (f"stop {stop:g}" if stop else "no stop") + f", counted as risk {risk:.2f}")
+        event("unknown_position", p["label"], message)
+        alerts.notify("DLH: position at the broker that this system didn't open", f"{p['label']}: {message}",
+                      key=f"unknown_position:{p['label']}")
+    return external
 
 
 def _with_live_bars(bars: pd.DataFrame, broker: Broker, symbol: str, tf: str, start: pd.Timestamp,
@@ -249,9 +320,11 @@ def _handle_signal(strategy, tf, sym, bar, sig, side, *, now, settings, backtest
     sid = signal_id(strategy, tf, sym, bar["ts"])
     balance = book.balance()
     new_risk = balance * backtest.risk_per_trade
+    side_name = "long" if side > 0 else "short"
     reason = risk.check(settings, kill_switch=kill, busy=book.busy(strategy, tf, sym), stale=stale,
-                        balance=balance, open_count=len(book.live()), open_risk=sum(r.risk for r in book.live()),
-                        new_risk=new_risk)
+                        balance=balance, open_count=len(book.exposure()),
+                        open_risk=sum(r.risk for r in book.exposure()), new_risk=new_risk,
+                        symbol_risk=book.symbol_risk(sym, side_name))
     target = store.clean(float(sig["target"]))
     row = {"signal_id": sid, "date": bar["ts"].date(), "strategy": strategy, "timeframe": tf, "symbol": sym,
            "bar_ts": bar["ts"], "side": "long" if side > 0 else "short", "stop": float(sig["stop"]),

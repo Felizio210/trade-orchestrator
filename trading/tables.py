@@ -28,6 +28,9 @@ APPROVALS_SCHEMA = [
     Field("win_rate", "FLOAT64"),
     Field("avg_r", "FLOAT64"),
     Field("decided_at", "TIMESTAMP", "REQUIRED"),
+    Field("metrics_window", "STRING"),  # full (fixed parameters) | oos (walk-forward) - what the standards were checked on
+    Field("recent_return", "FLOAT64"),  # return over the run's last BACKTEST_RECENT_DAYS
+    Field("recent_trades", "INT64"),
 ]
 
 SIGNALS_SCHEMA = [
@@ -112,7 +115,7 @@ ACCOUNT_SCHEMA = [
 ]
 
 CONTROLS_SCHEMA = [
-    Field("key", "STRING", "REQUIRED"),  # kill_switch
+    Field("key", "STRING", "REQUIRED"),  # kill_switch | broker_status
     Field("value", "STRING"),  # empty/NULL = off, otherwise why it was turned on
     Field("updated_at", "TIMESTAMP", "REQUIRED"),
 ]
@@ -126,6 +129,26 @@ EVENTS_SCHEMA = [
     Field("message", "STRING", "REQUIRED"),
 ]
 
+DRIFT_SCHEMA = [  # live trading against the backtest on the same bars, per strategy/timeframe/symbol and day
+    Field("date", "DATE", "REQUIRED"),  # when it was computed
+    Field("strategy", "STRING", "REQUIRED"),
+    Field("timeframe", "STRING", "REQUIRED"),
+    Field("symbol", "STRING", "REQUIRED"),
+    Field("run_id", "STRING", "REQUIRED"),  # the backtest compared with
+    Field("window_start", "TIMESTAMP", "REQUIRED"),
+    Field("window_end", "TIMESTAMP", "REQUIRED"),
+    Field("live_trades", "INT64", "REQUIRED"),
+    Field("backtest_trades", "INT64", "REQUIRED"),
+    Field("matched", "INT64", "REQUIRED"),  # same entry bar and side
+    Field("missed_explained", "INT64", "REQUIRED"),  # backtest traded; live had the signal but skipped/rejected it
+    Field("missed_unexplained", "INT64", "REQUIRED"),  # backtest traded; live never saw the signal
+    Field("extra", "INT64", "REQUIRED"),  # live traded; the backtest didn't
+    Field("entry_slippage_r", "FLOAT64"),  # mean (live entry - backtest entry) against the trade, in R
+    Field("live_avg_r", "FLOAT64"),  # mean R of matched closed trades, live
+    Field("backtest_avg_r", "FLOAT64"),  # ... and in the backtest
+    Field("computed_at", "TIMESTAMP", "REQUIRED"),
+]
+
 # table -> (schema, partition field, cluster fields, key)
 TABLES = {
     "approvals": (APPROVALS_SCHEMA, None, ["strategy"], ["strategy", "timeframe", "symbol"]),
@@ -136,6 +159,7 @@ TABLES = {
     "account": (ACCOUNT_SCHEMA, "date", None, ["ts"]),
     "controls": (CONTROLS_SCHEMA, None, None, ["key"]),
     "events": (EVENTS_SCHEMA, "date", ["kind"], ["event_id"]),
+    "drift": (DRIFT_SCHEMA, "date", ["strategy"], ["date", "strategy", "timeframe", "symbol"]),
 }
 
 

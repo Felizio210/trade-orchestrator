@@ -29,6 +29,8 @@ from ingestion.dukascopy.client import CANDLE_SIDES, decode_candles
 from ingestion.dukascopy.converter import read_day_dir
 from ingestion.dukascopy.downloader import candle_path, download_day, problem_summary, problems, raw_day_dir
 from ingestion.dukascopy.instruments import point_factor
+from ingestion.dukascopy import quality
+from ingestion.dukascopy.market_hours import open_hours
 from ingestion.dukascopy.tables import CLUSTER_FIELDS, PARTITION_FIELD, bq_table_id, dataset_name, schema_for, shape
 from ingestion.dukascopy.transform import candles_to_bars, resample_bars, ticks_to_bars
 
@@ -67,7 +69,24 @@ def setup(settings: Settings, cloud: Cloud) -> list[str]:
         cloud.bq.ensure_dataset(table_id.split(".")[0])
         cloud.bq.ensure_table(table_id, schema_for(ds), PARTITION_FIELD, CLUSTER_FIELDS)
         created.append(f"table {table_id}")
+    cloud.bq.ensure_dataset(settings.bq_dataset)
+    cloud.bq.ensure_table(quality.quality_table(settings.bq_dataset), quality.QUALITY_SCHEMA, "date", ["symbol"])
+    created.append(f"table {quality.quality_table(settings.bq_dataset)}")
     return created
+
+
+def empty_uri(settings: Settings, symbol: str, day: date) -> str:
+    """Marker for a day that was checked and has no data because the market was closed all day
+    (e.g. Good Friday), so it isn't downloaded again on every run."""
+    return (f"gs://{settings.gcs_bucket}/{settings.gcs_prefix}/{settings.lake_format}/_empty/"
+            f"symbol={symbol}/date={day.isoformat()}/EMPTY")
+
+
+def in_lake(settings: Settings, cloud: Cloud, symbol: str, day: date, datasets: list[str] | None = None) -> bool:
+    """The day is done: every dataset's file is in the lake, or it is marked as empty."""
+    symbol = symbol.upper()
+    return (all(cloud.storage.exists(lake_uri(settings, d, symbol, day)) for d in datasets or _dataset_names(settings))
+            or cloud.storage.exists(empty_uri(settings, symbol, day)))
 
 
 def lake_uri(settings: Settings, dataset: str, symbol: str, day: date) -> str:
@@ -134,7 +153,14 @@ def publish_day(
 
     frames = _day_frames(symbol, day, settings, datetime.now(timezone.utc))
     if not frames:
-        log.info("%s %s: no data (market closed), nothing to publish", symbol, day)
+        if open_hours(day) == 0:
+            cloud.storage.upload_bytes(empty_uri(settings, symbol, day), b"", "text/plain")
+            log.info("%s %s: no data, market closed all day: marked empty", symbol, day)
+            summary["empty"] = True
+        else:
+            # Not marked: a day that should have traded may just not be published yet
+            log.warning("%s %s: no data although the market was open %dh; not marked, will be retried",
+                        symbol, day, open_hours(day))
         return summary
 
     for dataset, df in frames.items():
@@ -185,7 +211,7 @@ def load_intraday(
     day = (until - timedelta(hours=1)).date()
     bar_datasets = [dataset_name("bars", tf) for tf in settings.bar_timeframes]
     summary = {"symbol": symbol, "date": day.isoformat(), "until": until.isoformat(), "rows": 0}
-    if all(cloud.storage.exists(lake_uri(settings, d, symbol, day)) for d in bar_datasets):
+    if in_lake(settings, cloud, symbol, day, bar_datasets):
         return {**summary, "status": "complete", "last_hour": "ok"}
 
     manifest = download_day(symbol, day, settings, client=client, until=until)
@@ -228,6 +254,7 @@ def _day_frames(symbol: str, day: date, settings: Settings, ingested_at: datetim
             tf_bars = resample_bars(base, tf) if bars is not None else ticks_to_bars(ticks, tf, settings.bar_price_side)
             frames[dataset_name("bars", tf)] = shape(
                 tf_bars, "bars", symbol, day, ingested_at, timeframe=tf, price_side=settings.bar_price_side,
+                source=settings.bar_source,
             )
     return frames
 
@@ -241,13 +268,23 @@ def _read_candle_bars(symbol: str, day: date, settings: Settings) -> pd.DataFram
     return candles_to_bars(sides["BID"], sides["ASK"], settings.bar_price_side)
 
 
-def load_message(payload: dict, cloud: Cloud) -> int:
-    """Load one published file into BigQuery, replacing that symbol/day."""
-    match = {"symbol": payload["symbol"], "date": date.fromisoformat(payload["date"])}
+def load_message(payload: dict, cloud: Cloud, bq_dataset: str | None = None) -> tuple[int, list[dict]]:
+    """Load one published file into BigQuery, replacing that symbol/day. For bars, the day is
+    then checked (quality.py) and the results written to {bq_dataset}.quality; returns
+    (rows loaded, quality rows that aren't ok)."""
+    day = date.fromisoformat(payload["date"])
+    match = {"symbol": payload["symbol"], "date": day}
+    bars = payload["dataset"].startswith("bars_") and bq_dataset is not None
+    before = quality.provisional_snapshot(cloud, payload["table"], payload["symbol"], day) if bars else None
     rows = cloud.bq.replace_from_uri(payload["uri"], payload["table"], match)
     if "rows" in payload and rows != payload["rows"]:
         raise RuntimeError(f"Loaded {rows} rows from {payload['uri']}, expected {payload['rows']}")
-    return rows
+    if not bars:
+        return rows, []
+    checks = quality.check_bars(cloud, payload["table"], payload["dataset"].removeprefix("bars_"),
+                                payload["symbol"], day, provisional=before)
+    quality.write(cloud, bq_dataset, checks)
+    return rows, [c for c in checks if c["status"] != "ok"]
 
 
 def load_pending(settings: Settings, cloud: Cloud, *, max_messages: int | None = None) -> dict:
@@ -257,7 +294,7 @@ def load_pending(settings: Settings, cloud: Cloud, *, max_messages: int | None =
     so Pub/Sub redelivers them after the ack deadline (i.e. on a later run); they are
     not retried in this run.
     """
-    loaded, failed = [], []
+    loaded, failed, issues = [], [], []
     empty_pulls = 0
     while max_messages is None or len(loaded) + len(failed) < max_messages:
         batch = cloud.pubsub.pull(settings.pubsub_subscription, max_messages=10)
@@ -271,17 +308,20 @@ def load_pending(settings: Settings, cloud: Cloud, *, max_messages: int | None =
         for msg in batch:
             try:
                 payload = json.loads(msg.data)
-                rows = load_message(payload, cloud)
+                rows, found = load_message(payload, cloud, settings.bq_dataset)
             except Exception as exc:
                 log.exception("Failed to load message %s", msg.message_id)
                 failed.append({"message_id": msg.message_id, "error": f"{type(exc).__name__}: {exc}",
                                "delivery_attempt": msg.delivery_attempt})
                 continue
             cloud.pubsub.ack(settings.pubsub_subscription, [msg.ack_id])
+            issues += found
             loaded.append({"table": payload["table"], "symbol": payload["symbol"], "date": payload["date"],
                            "rows": rows})
             log.info("Loaded %s rows into %s (%s %s)", rows, payload["table"], payload["symbol"], payload["date"])
-    return {"loaded": loaded, "failed": failed}
+    return {"loaded": loaded, "failed": failed,
+            "quality_failed": [i for i in issues if i["status"] == "fail"],
+            "quality_warnings": [i for i in issues if i["status"] == "warn"]}
 
 
 def run_range(
@@ -328,8 +368,7 @@ def repair_start(symbols: list[str], start: date, settings: Settings, cloud: Clo
     datasets = _dataset_names(settings)
     day = start - timedelta(days=1)
     while day >= start - timedelta(days=max_days):
-        if day.weekday() != 5 and all(cloud.storage.exists(lake_uri(settings, ds, symbol.upper(), day))
-                                      for symbol in symbols for ds in datasets):
+        if day.weekday() != 5 and all(in_lake(settings, cloud, symbol, day, datasets) for symbol in symbols):
             return min(start, day + timedelta(days=1))
         day -= timedelta(days=1)
     return start
@@ -360,12 +399,13 @@ def backfill_range(
         end = last_complete_day()
     client = client or DukascopyClient(settings)
     datasets = _dataset_names(settings)
-    result: dict = {"published": [], "skipped": [], "existing": 0, "loaded": [], "failed": []}
+    result: dict = {"published": [], "skipped": [], "existing": 0, "loaded": [], "failed": [], "quality_failed": []}
 
     def flush(month: str) -> None:
         loaded = load_pending(settings, cloud)
         result["loaded"] += loaded["loaded"]
         result["failed"] += loaded["failed"]
+        result["quality_failed"] += loaded["quality_failed"]
         if on_month_done:
             on_month_done(month, result)
 
@@ -376,7 +416,7 @@ def backfill_range(
             month = day.strftime("%Y-%m")
         if day.weekday() != 5:
             for symbol in (s.upper() for s in symbols):
-                if not force and all(cloud.storage.exists(lake_uri(settings, ds, symbol, day)) for ds in datasets):
+                if not force and in_lake(settings, cloud, symbol, day, datasets):
                     result["existing"] += 1
                     continue
                 manifest = download_day(symbol, day, settings, client=client)

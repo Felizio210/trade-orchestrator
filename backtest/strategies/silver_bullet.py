@@ -36,6 +36,9 @@ DEFAULTS = {
     "rr": 2.0,  # target = rr x risk
 }
 
+# Walk-forward tries every combination of these on each training window (the rest stay at DEFAULTS)
+GRID = {"disp_body_atr": [0.75, 1.0, 1.5], "rr": [1.5, 2.0, 3.0]}
+
 
 def signals(bars: pd.DataFrame, *, windows, liq_bars, atr_len, disp_body_atr, min_gap_atr, stop_buffer_atr,
             rr) -> pd.DataFrame:

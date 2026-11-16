@@ -7,12 +7,14 @@ from trading.config import TradingSettings
 
 
 def check(settings: TradingSettings, *, kill_switch: bool, busy: bool, stale: bool, balance: float,
-          open_count: int, open_risk: float, new_risk: float) -> str | None:
+          open_count: int, open_risk: float, new_risk: float, symbol_risk: float = 0.0) -> str | None:
     """None if the signal may be ordered, otherwise why not.
 
     busy: this strategy already has an open position or pending order on this
     timeframe/symbol (one at a time, as in the backtest). open_count / open_risk count
-    open positions and pending orders across the account.
+    open positions and pending orders across the account, external positions included.
+    symbol_risk: risk already on this symbol in the same direction, from any strategy: two
+    strategies long gold at once are one bet at double size.
     """
     if kill_switch:
         return "kill switch on"
@@ -26,4 +28,6 @@ def check(settings: TradingSettings, *, kill_switch: bool, busy: bool, stale: bo
         return f"max open positions ({open_count:.0f})"
     if settings.max_open_risk is not None and open_risk + new_risk > settings.max_open_risk * balance:
         return f"max open risk ({(open_risk + new_risk) / balance:.1%} of balance)"
+    if settings.max_symbol_risk is not None and symbol_risk + new_risk > settings.max_symbol_risk * balance * (1 + 1e-9):
+        return f"max risk on the symbol ({(symbol_risk + new_risk) / balance:.1%} of balance)"
     return None

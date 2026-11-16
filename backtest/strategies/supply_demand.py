@@ -28,6 +28,9 @@ DEFAULTS = {
     "zone_max_age": 500,  # bars a zone stays live
 }
 
+# Walk-forward tries every combination of these on each training window (the rest stay at DEFAULTS)
+GRID = {"impulse_body_atr": [1.25, 1.5, 2.0], "rr": [1.5, 2.0, 3.0]}
+
 
 def signals(bars: pd.DataFrame, *, atr_len, base_max, base_body_atr, impulse_body_atr, stop_buffer_atr,
             rr, max_zones, zone_max_age) -> pd.DataFrame:

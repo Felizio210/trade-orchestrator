@@ -8,8 +8,7 @@ replaces. dukascopy_repair (09:00) fills anything finalize missed.
 
 intraday runs whatever finalize did, so trading never waits on yesterday; a failed finalize
 or load still marks the run failed. freshness fails the run when the newest bars are too old,
-so a stalled feed shows up as a failed task. Emits the hourly bars Dataset once today's bars
-are loaded; nothing is scheduled on it now (trading_live runs on its own 5-minute cron).
+so a stalled feed shows up as a failed task. trading_live runs on its own 5-minute cron.
 """
 
 from datetime import timedelta
@@ -17,8 +16,6 @@ from datetime import timedelta
 import dlh_tasks
 import pendulum
 from airflow import DAG
-from airflow.datasets import Dataset
-from airflow.operators.empty import EmptyOperator
 from airflow.operators.python import PythonOperator
 from airflow.utils.trigger_rule import TriggerRule
 
@@ -29,16 +26,16 @@ with DAG(
     start_date=pendulum.datetime(2026, 10, 30, tz="UTC"),
     catchup=False,  # each run picks up every closed hour of the day anyway
     max_active_runs=1,  # one Dukascopy client at a time (rate limits), one writer
-    default_args={"retries": 3, "retry_delay": timedelta(minutes=10), "execution_timeout": timedelta(minutes=20)},
+    default_args={"on_failure_callback": dlh_tasks.on_failure, "retries": 3, "retry_delay": timedelta(minutes=10), "execution_timeout": timedelta(minutes=20)},
     tags=["dukascopy", "trading"],
 ) as dag:
     # No retries: they would hold up intraday; the next hourly run is the retry
-    finalize = PythonOperator(task_id="finalize", python_callable=dlh_tasks.finalize, retries=0)
+    finalize = PythonOperator(task_id="finalize", python_callable=dlh_tasks.finalize, retries=0,
+                              pool=dlh_tasks.DUKASCOPY_POOL)
     load = PythonOperator(task_id="load", python_callable=dlh_tasks.load)
     # After finalize, so at 00:10 it finds yesterday already in the lake and leaves it alone
     intraday = PythonOperator(task_id="intraday", python_callable=dlh_tasks.intraday,
-                              trigger_rule=TriggerRule.ALL_DONE)
-    notify = EmptyOperator(task_id="notify", outlets=[Dataset(dlh_tasks.HOURLY_BARS)])
+                              trigger_rule=TriggerRule.ALL_DONE, pool=dlh_tasks.DUKASCOPY_POOL)
     # Runs whatever intraday did (a stall is exactly when intraday fails); fails when the
     # newest bars are more than DUKASCOPY_MAX_LAG_HOURS market hours old. No retries: the
     # next hourly run checks again.
@@ -46,5 +43,4 @@ with DAG(
                                retries=0, trigger_rule=TriggerRule.ALL_DONE)
 
     finalize >> [load, intraday]
-    intraday >> notify
     [load, intraday] >> freshness

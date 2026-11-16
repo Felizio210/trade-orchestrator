@@ -36,6 +36,20 @@ class Broker(ABC):
     def unrealized(self, position: Position, bar: pd.Series) -> float:
         """Open PnL of a position at the close of `bar`, on the side it would exit on."""
 
+    def health(self) -> str | None:
+        """None when the broker can take orders, otherwise why not (e.g. "bridge not reachable").
+        The executor skips a step while it's down instead of failing every run."""
+        return None
+
+    def label_for(self, order_id: str) -> str:
+        """The name the broker knows an order by (its label), for matching open_positions()."""
+        return order_id
+
+    def open_positions(self) -> list[dict] | None:
+        """Every position open at the broker, ours or not: [{"label", "symbol", "side", "qty",
+        "open_price", "stop"}]. None when the broker can't list them (paper: everything is ours)."""
+        return None
+
     def balance(self) -> float | None:
         """The account balance when the broker holds one; None means the executor computes it
         from TRADING_PAPER_CAPITAL and the recorded positions."""

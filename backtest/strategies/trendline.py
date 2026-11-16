@@ -29,6 +29,9 @@ DEFAULTS = {
     "rr": 2.0,
 }
 
+# Walk-forward tries every combination of these on each training window (the rest stay at DEFAULTS)
+GRID = {"pivot_len": [3, 5, 8], "rr": [1.5, 2.0, 3.0]}
+
 
 class _Line:
     def __init__(self, i1: int, p1: float, i2: int, p2: float):

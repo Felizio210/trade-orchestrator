@@ -1,7 +1,8 @@
 """Strategy registry.
 
 A strategy module has DEFAULTS (every parameter with its default), optionally
-MAX_TIMEFRAME (the slowest bars it can work on, e.g. "15min"), and
+MAX_TIMEFRAME (the slowest bars it can work on, e.g. "15min") and GRID (parameter -> values
+walk-forward chooses from), and
 signals(bars, **params) -> DataFrame with one row per bar:
     signal  +1 long, -1 short, 0 nothing; decided at the bar's close, filled at the next open
     stop    absolute stop price (required with a signal)
@@ -40,6 +41,20 @@ def resolve_params(name: str, overrides: dict[str, str] | None = None) -> dict[s
         else:
             params[key] = type(default)(raw)
     return params
+
+
+def grid(name: str, base: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every parameter set walk-forward tries: `base` with each combination of the GRID values.
+    `base` itself comes first, so on a tie the defaults (or the --param overrides) win."""
+    import itertools
+
+    spec = getattr(get(name), "GRID", {})
+    combos = [base]
+    for values in itertools.product(*spec.values()):
+        params = {**base, **dict(zip(spec, values))}
+        if params not in combos:
+            combos.append(params)
+    return combos
 
 
 def get(name: str) -> ModuleType:

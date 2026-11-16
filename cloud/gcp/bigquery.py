@@ -116,7 +116,8 @@ class BigQueryWarehouse(Warehouse):
             config = bigquery.LoadJobConfig(source_format=bigquery.SourceFormat.PARQUET)
         elif uri.endswith(".csv"):
             config = bigquery.LoadJobConfig(
-                source_format=bigquery.SourceFormat.CSV, skip_leading_rows=1, schema=target.schema
+                source_format=bigquery.SourceFormat.CSV, skip_leading_rows=1, schema=target.schema,
+                allow_jagged_rows=True,  # files written before a column was added just lack it
             )
         else:
             raise ValueError(f"Only .parquet and .csv loads are supported, got {uri}")

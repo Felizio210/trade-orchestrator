@@ -44,7 +44,7 @@ def download(settings, monkeypatch, fetch):
 def test_setup_creates_everything(env):
     settings, cloud = env
     assert cloud.pubsub.list_topics() == ["dukascopy-files"]
-    assert cloud.bq.list_tables("market") == ["dukascopy_ticks"]
+    assert cloud.bq.list_tables("market") == ["dukascopy_ticks", "quality"]
     for tf in ("1min", "5min", "15min", "1h"):  # one BigQuery dataset per timeframe
         assert cloud.bq.list_tables(f"market_{tf}") == ["dukascopy_bars"]
 
@@ -86,7 +86,7 @@ def test_publish_then_load(env, monkeypatch):
     publish_day("EURUSD", DAY, settings, cloud)
     load_pending(settings, cloud)
     assert cloud.bq.query("SELECT COUNT(*) AS n FROM market.dukascopy_ticks").n[0] == 3
-    assert load_pending(settings, cloud) == {"loaded": [], "failed": []}
+    assert load_pending(settings, cloud) == {"loaded": [], "failed": [], "quality_failed": [], "quality_warnings": []}
 
 
 def test_raw_upload_and_parquet_are_opt_in(tmp_path, monkeypatch):
@@ -510,3 +510,111 @@ def test_freshness_fails_when_a_symbol_has_no_bars(tmp_path, monkeypatch):
     dlh_tasks, settings, cloud, fetched = _tasks(tmp_path, monkeypatch)
     with pytest.raises(RuntimeError, match="EURUSD 1min: no bars"):
         dlh_tasks.freshness(data_interval_end=datetime(2026, 10, 29, 3, 10, tzinfo=timezone.utc))
+
+
+
+# --- empty days, bar source, quality ---
+
+def test_a_closed_day_is_marked_empty_and_never_fetched_again(tmp_path, monkeypatch):
+    from ingestion.dukascopy.pipeline import empty_uri, in_lake
+
+    settings = Settings(local_data_dir=str(tmp_path / "data"), symbols=["EURUSD"], datasets=["bars"],
+                        bar_timeframes=["1h"])
+    cloud = Cloud(CloudSettings(env="local", local_dir=str(tmp_path / ".local_gcp")))
+    setup(settings, cloud)
+    fetched = []
+    monkeypatch.setattr(DukascopyClient, "fetch_hour_raw", lambda self, s, h: fetched.append(h) or b"")
+    good_friday, thursday = date(2026, 4, 3), date(2026, 4, 2)
+    backfill_range(["EURUSD"], good_friday, good_friday, settings, cloud)
+    assert cloud.storage.exists(empty_uri(settings, "EURUSD", good_friday)) and len(fetched) == 24
+    backfill_range(["EURUSD"], good_friday, good_friday, settings, cloud)
+    assert len(fetched) == 24  # not fetched again
+
+    # A day the market was open with no data at all is suspicious: not marked, so it's retried
+    backfill_range(["EURUSD"], thursday, thursday, settings, cloud)
+    assert not in_lake(settings, cloud, "EURUSD", thursday)
+
+
+def test_ticks_and_candles_build_the_same_bars(tmp_path):
+    """The CLI may build bars from candle files, the DAGs from ticks: both must agree, and say which they were."""
+    from ingestion.dukascopy.downloader import candle_path, raw_hour_path
+    from ingestion.dukascopy.pipeline import _day_frames
+
+    rng = np.random.default_rng(3)
+    day = date(2026, 9, 3)
+    ticks = []
+    for hour in (9, 10, 13):
+        ms = np.sort(rng.choice(3_600_000, size=400, replace=False))
+        bid = 117_000 + np.cumsum(rng.integers(-3, 4, size=400))
+        ticks.append((hour, [(int(m), int(b) + 2, int(b), float(rng.integers(1, 4)), float(rng.integers(1, 4)))
+                             for m, b in zip(ms, bid)]))
+    base = dict(local_data_dir=str(tmp_path / "data"), symbols=["EURUSD"], datasets=["bars"],
+                bar_timeframes=["1min", "1h"])
+    tick_settings, candle_settings = Settings(**base), Settings(**base, bar_source="candles")
+    for hour, rows in ticks:
+        path = raw_hour_path(tick_settings.raw_dir, "EURUSD", datetime(2026, 9, 3, hour, tzinfo=timezone.utc))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(make_bi5(rows))
+    # Candle files as Dukascopy builds them from the same ticks: every minute, volume 0 when nothing traded
+    for side, price_col, vol_col in (("BID", 2, 4), ("ASK", 1, 3)):
+        minutes = {}
+        for hour, rows in ticks:
+            for r in rows:
+                minutes.setdefault(hour * 60 + r[0] // 60_000, []).append((r[price_col], r[vol_col]))
+        records = []
+        for m in range(1440):
+            if m in minutes:
+                p = [x[0] for x in minutes[m]]
+                records.append((m * 60, p[0], p[-1], min(p), max(p), sum(x[1] for x in minutes[m])))
+            else:
+                records.append((m * 60, 0, 0, 0, 0, 0.0))
+        path = candle_path(candle_settings.raw_dir, "EURUSD", day, side)
+        path.write_bytes(lzma.compress(np.array(records, dtype=CANDLE_DTYPE).tobytes(), format=lzma.FORMAT_ALONE))
+
+    now = datetime(2026, 9, 4, tzinfo=timezone.utc)
+    from_ticks, from_candles = _day_frames("EURUSD", day, tick_settings, now), _day_frames("EURUSD", day, candle_settings, now)
+    for ds in ("bars_1min", "bars_1h"):
+        cols = ["ts", "open", "high", "low", "close", "volume"]
+        assert len(from_ticks[ds]) > 0
+        assert from_ticks[ds][cols].reset_index(drop=True).equals(from_candles[ds][cols].reset_index(drop=True))
+        assert set(from_ticks[ds]["source"]) == {"ticks"} and set(from_candles[ds]["source"]) == {"candles"}
+
+
+def test_quality_checks_after_each_load(tmp_path):
+    import pandas as pd
+
+    from ingestion.dukascopy import quality
+    from ingestion.dukascopy.tables import bq_table_id, shape
+
+    settings = Settings(local_data_dir=str(tmp_path / "data"), symbols=["EURUSD"], datasets=["bars"],
+                        bar_timeframes=["1h"])
+    cloud = Cloud(CloudSettings(env="local", local_dir=str(tmp_path / ".local_gcp")))
+    setup(settings, cloud)
+    table = bq_table_id("market", "bars_1h")
+
+    def load(day, hours, bad_hour=None, close=1.1):
+        ts = pd.date_range(f"{day} 00:00", periods=24, freq="h", tz="UTC")[hours]
+        df = pd.DataFrame({"ts": ts, "open": 1.1, "high": 1.2, "low": 1.0, "close": close, "volume": 1.0})
+        if bad_hour is not None:
+            df.loc[df["ts"].dt.hour == bad_hour, "high"] = 0.9  # high below low
+        cloud.bq.replace_from_dataframe(shape(df, "bars", "EURUSD", day, ts[0], timeframe="1h", price_side="bid"),
+                                        table, {"symbol": "EURUSD", "date": day})
+
+    wed, thu = date(2026, 11, 4), date(2026, 11, 5)  # winter: open every hour but 22:00 UTC
+    load(wed, [h for h in range(24) if h != 22])
+    load(thu, list(range(10)))  # provisional: the intraday load's first 10 hours
+    before = quality.provisional_snapshot(cloud, table, "EURUSD", thu)
+    load(thu, [h for h in range(24) if h != 22], bad_hour=5, close=1.15)
+    rows = {r["rule"]: r for r in quality.check_bars(cloud, table, "1h", "EURUSD", thu, provisional=before)}
+    assert rows["ohlc"]["status"] == "fail" and "1 bad bars" in rows["ohlc"]["detail"]
+    assert rows["hours"]["status"] == "ok" and rows["previous_day"]["status"] == "ok"
+    assert rows["duplicates"]["status"] == rows["in_day"]["status"] == "ok"
+    assert rows["provisional"]["detail"] == "of 10 provisional bars, 10 changed close, 0 gone"
+    quality.write(cloud, "market", list(rows.values()))
+    assert len(cloud.bq.query("SELECT * FROM market.quality")) == 6
+
+    # Monday's previous trading day is Sunday (the session opens 23:00 UTC in winter), not Friday
+    monday = date(2026, 11, 9)
+    load(monday, [h for h in range(24) if h != 22])
+    rows = {r["rule"]: r for r in quality.check_bars(cloud, table, "1h", "EURUSD", monday)}
+    assert (rows["previous_day"]["status"], rows["previous_day"]["detail"]) == ("warn", "no bars on 2026-11-08")

@@ -168,3 +168,7 @@ class Warehouse(ABC):
 
     @abstractmethod
     def list_tables(self, dataset: str) -> list[str]: ...
+
+    def compact(self, dataset: str) -> None:
+        """Give back the space of deleted rows, where the backend needs it (local SQLite: VACUUM).
+        BigQuery manages storage itself, so by default this does nothing."""

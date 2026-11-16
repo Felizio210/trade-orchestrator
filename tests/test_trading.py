@@ -62,7 +62,7 @@ def test_upsert_replaces_by_key(bq):
 # --- gate ---
 
 GOOD = {"n_trades": 120, "sharpe": 1.5, "profit_factor": 1.6, "max_drawdown": -0.08, "avg_r": 0.3,
-        "win_rate": 0.45, "total_return": 0.2}
+        "win_rate": 0.45, "total_return": 0.2, "recent_return": 0.03}
 
 
 def test_check_lists_every_failed_standard():
@@ -95,14 +95,20 @@ def env(tmp_path):
     return cloud, market, backtest, bars.drop(columns="date")
 
 
-def write_metrics(cloud, run_id, created_at, **metrics):
+def write_metrics(cloud, run_id, created_at, scope=None, recent_return=0.03, **metrics):
+    """A done daily run with its metrics (scope None = written before scopes existed = full),
+    plus its recent-window row unless recent_return is None."""
     cloud.bq.replace_from_dataframe(pd.DataFrame([{
         "run_id": run_id, "strategy": STRATEGY, "params_json": json.dumps({"rr": 2.0}), "symbols": "EURUSD",
         "timeframe": "1h", "start_date": date(2024, 1, 1), "end_date": date(2026, 1, 1), "initial_capital": 1e4,
         "risk_per_trade": 0.01, "spread_json": "{}", "commission_rate": 0.0, "status": "done",
         "created_at": created_at}]), "backtest.runs", {"run_id": run_id})
-    cloud.bq.replace_from_dataframe(pd.DataFrame([{"run_id": run_id, "symbol": "EURUSD", "exposure": 0.1,
-                                                   **{**GOOD, **metrics}}]), "backtest.metrics", {"run_id": run_id})
+    good = {k: v for k, v in GOOD.items() if k != "recent_return"}
+    rows = [{"run_id": run_id, "symbol": "EURUSD", "exposure": 0.1, "scope": scope, **{**good, **metrics}}]
+    if recent_return is not None:
+        rows.append({"run_id": run_id, "symbol": "EURUSD", "scope": "recent", **good, "n_trades": 12,
+                     "total_return": recent_return})
+    cloud.bq.replace_from_dataframe(pd.DataFrame(rows), "backtest.metrics", {"run_id": run_id})
 
 
 def test_gate_approves_revokes_and_ignores_adhoc_runs(env):
@@ -136,6 +142,29 @@ def test_gate_judges_only_the_newest_run_and_rejects_it_when_stale(env):
     assert row["status"] == "approved"
     [row] = evaluate(settings, backtest, cloud, now=t0 + timedelta(days=12))
     assert (row["status"], row["reasons"]) == ("rejected", "latest backtest is 10 days old (max 3)")
+
+
+def test_gate_uses_out_of_sample_metrics_and_the_recent_window(env):
+    cloud, _market, backtest, _bars = env
+    t0 = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    # A walk-forward run: the oos row is judged (sharpe 1.2), not the in-sample full row (sharpe 3.0)
+    write_metrics(cloud, "daily-wf", t0, scope="oos", sharpe=1.2)
+    extra = pd.DataFrame([{"run_id": "daily-wf", "symbol": "EURUSD", "scope": "full", **{
+        k: v for k, v in GOOD.items() if k != "recent_return"}, "sharpe": 3.0}])
+    rows = pd.concat([cloud.bq.query("SELECT * FROM backtest.metrics WHERE run_id = 'daily-wf'"), extra])
+    cloud.bq.replace_from_dataframe(rows, "backtest.metrics", {"run_id": "daily-wf"})
+    [row] = evaluate(TradingSettings(require_out_of_sample=True), backtest, cloud, now=t0)
+    assert (row["status"], row["metrics_window"], row["sharpe"], row["recent_trades"]) == ("approved", "oos", 1.2, 12)
+
+    # Still fine over two years, but losing over the last 90 days: revoked
+    write_metrics(cloud, "daily-later", t0 + timedelta(days=1), scope="oos", recent_return=-0.04)
+    [row] = evaluate(TradingSettings(), backtest, cloud, now=t0 + timedelta(days=1))
+    assert (row["status"], row["reasons"]) == ("rejected", "recent_return -4.0% < 0.0%")
+
+    # A fixed-parameter (in-sample) run can't approve when out-of-sample is required
+    write_metrics(cloud, "daily-fixed", t0 + timedelta(days=2))
+    [row] = evaluate(TradingSettings(require_out_of_sample=True), backtest, cloud, now=t0 + timedelta(days=2))
+    assert (row["metrics_window"], row["reasons"]) == ("full", "not a walk-forward (out-of-sample) backtest")
 
 
 def test_gate_rejects_timeframes_faster_than_the_trading_schedule(env):
@@ -337,3 +366,34 @@ def test_intraday_needs_tick_source(tmp_path):
     cloud = Cloud(CloudSettings(env="local", local_dir=str(tmp_path / ".local_gcp")))
     with pytest.raises(ValueError, match="ticks"):
         load_intraday("EURUSD", market, cloud, now=datetime(2026, 10, 29, 3, 10, tzinfo=timezone.utc))
+
+
+# --- live against the backtest ---
+
+def test_drift_lines_paper_trades_up_with_the_backtest(env):
+    from backtest.runner import run as backtest_run
+    from trading.drift import compare
+
+    cloud, market, backtest, bars = env
+    k, end = 200, len(bars) - 1
+    start_day, end_day = bars["ts"].iloc[0].date(), bars["ts"].iloc[-1].date()
+    backtest_run(STRATEGY, ["EURUSD"], "1h", start_day, end_day, backtest, market, cloud, run_id="daily-x",
+                 walk_forward_mode=False)
+    approve(cloud, after(bars, end))
+    set_cursor(cloud, bars["ts"].iloc[k])
+    t = bars["ts"].iloc[k]
+    store.write(cloud, "trading", "events", [
+        {"event_id": "tracking:1h:EURUSD", "ts": t, "date": t.date(), "kind": "tracking", "ref": "1h:EURUSD",
+         "message": "x"},
+        {"event_id": "approved:x", "ts": t, "date": t.date(), "kind": "approved", "ref": f"{STRATEGY}:1h:EURUSD",
+         "message": "x"}])
+    step(NO_LIMITS, backtest, market, cloud, now=after(bars, end))
+
+    [row] = compare(replace(NO_LIMITS, drift_days=3650), backtest, cloud, now=after(bars, end))
+    assert row["live_trades"] > 5 and row["missed_unexplained"] == 0
+    # The backtest may hold a position across the cursor that live trading never had: at most one
+    # trade differs at the start, everything after lines up exactly
+    assert row["matched"] >= row["live_trades"] - 1 and row["extra"] <= 1
+    assert row["entry_slippage_r"] == pytest.approx(0.0, abs=1e-9)
+    assert row["live_avg_r"] == pytest.approx(row["backtest_avg_r"], rel=1e-6)
+    assert len(store.read(cloud, "trading", "drift")) == 1

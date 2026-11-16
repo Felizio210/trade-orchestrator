@@ -3,6 +3,7 @@ numpy>=1.26
 pandas>=2.1
 pyarrow>=15
 python-dotenv>=1.0
+python-dateutil>=2.8  # Easter, for market_hours.py
 # GCP version only (the local version never imports these)
 google-cloud-storage>=2.14
 google-cloud-pubsub>=2.21

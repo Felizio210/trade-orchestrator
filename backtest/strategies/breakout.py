@@ -21,6 +21,9 @@ DEFAULTS = {
     "rr": 2.0,
 }
 
+# Walk-forward tries every combination of these on each training window (the rest stay at DEFAULTS)
+GRID = {"length": [24, 48, 96], "stop_atr": [1.0, 1.5, 2.0]}
+
 
 def signals(bars: pd.DataFrame, *, length, slow, atr_len, stop_atr, rr) -> pd.DataFrame:
     c = bars["close"].to_numpy(dtype=float)

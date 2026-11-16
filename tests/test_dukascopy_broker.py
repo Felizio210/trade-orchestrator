@@ -2,7 +2,7 @@
 balance, and a trading step that only acts on the newest bar. No network."""
 
 import json
-from datetime import datetime, timezone
+from dataclasses import replace
 
 import pandas as pd
 import pytest
@@ -14,7 +14,7 @@ from cloud import Cloud, CloudSettings
 from ingestion.dukascopy.config import Settings
 from ingestion.dukascopy.pipeline import setup as market_setup
 from ingestion.dukascopy.tables import bq_table_id, shape
-from trading import executor, store
+from trading import executor, risk, store
 from trading.config import TradingSettings
 from trading.gate import setup as trading_setup
 from trading.brokers.dukascopy import BridgeError, DukascopyBroker, exit_reason, label
@@ -37,13 +37,20 @@ class FakeBridge(DukascopyBroker):
         self.account_equity = balance if equity is None else equity
         self.orders: dict[str, dict] = {}
         self.sent: list[dict] = []
+        self.external: list[dict] = []  # positions opened outside this system
 
     def _call(self, method, path, body=None, **query):
+        if path == "/health":
+            return {"connected": True, "account_id": "demo"}
+        if path == "/positions":
+            return {"positions": [{"label": o["label"], "symbol": "XAU/USD", "side": o["side"], "qty": o["qty"],
+                                   "open_price": o["open_price"], "stop": o["stop"]}
+                                  for o in [*self.orders.values(), *self.external] if o["state"] == "FILLED"]}
         if path == "/account":
             return {"balance": self.account_balance, "equity": self.account_equity, "currency": "USD"}
         if path == "/bars":
             self.bar_requests.append(query)
-            df = self.live[query["side"]]
+            df = (self.live or {}).get(query["side"], pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"]))
             df = df[df["ts"] >= pd.Timestamp(query["from"], unit="ms", tz="UTC")]
             return {"symbol": query["symbol"], "bars": [
                 {"time": int(r.ts.timestamp() * 1000), "open": r.open, "high": r.high, "low": r.low,
@@ -282,3 +289,68 @@ def test_on_the_5_minute_schedule_15min_bars_are_pulled_every_third_run(env5, mo
         pulled.append("15min" in loads)
     # The bar after the cursor closes at +30min: only the run at :16 past it (+31min) pulls it
     assert pulled == [False, False, False, True]
+
+
+# --- broker down, reconciliation, per-symbol risk ---
+
+class DownBridge(FakeBridge):
+    up = False
+
+    def _call(self, method, path, body=None, **query):
+        if not self.up:
+            raise BridgeError("bridge not reachable at http://bridge.test (refused); start it with bridge/run.sh")
+        return super()._call(method, path, body, **query)
+
+
+def test_a_down_broker_skips_the_step_and_alerts_once_per_outage(env, monkeypatch):
+    from ops import alerts
+
+    cloud, market, backtest, bars = env
+    sent = []
+    monkeypatch.setattr(alerts, "notify", lambda subject, text="", key=None: sent.append(subject) or ["test"])
+    set_cursor(cloud, bars["ts"].iloc[-2])
+    bridge = DownBridge()
+    for _ in range(3):
+        result = step(NO_LIMITS, backtest, market, cloud, broker=bridge, now=after(bars, len(bars) - 1))
+        assert result["broker"] == "down"
+    assert sent == ["DLH broker dukascopy is down"]
+    controls = store.read(cloud, "trading", "controls").set_index("key")
+    assert controls.loc["broker_status", "value"].startswith("down since")
+
+    bridge.up = True
+    result = step(NO_LIMITS, backtest, market, cloud, broker=bridge, now=after(bars, len(bars) - 1))
+    assert "broker" not in result and sent[-1] == "DLH broker dukascopy is back"
+    assert store.read(cloud, "trading", "controls").set_index("key").loc["broker_status", "value"] is None
+    kinds = store.read(cloud, "trading", "events")["kind"].tolist()
+    assert kinds.count("broker_down") == 1 and kinds.count("broker_up") == 1
+
+
+def test_a_position_opened_outside_the_system_counts_toward_the_limits(env, monkeypatch):
+    from ops import alerts
+
+    cloud, market, backtest, bars = env
+    monkeypatch.setattr(alerts, "notify", lambda *a, **k: [])
+    sig = strategies.run(STRATEGY, bars, strategies.resolve_params(STRATEGY))
+    last = sig.index[(sig["signal"] != 0) & (sig.index > 300)][-1]
+    approve(cloud, after(bars, len(bars) - 1))
+    close = float(bars["close"].iloc[last])
+    bridge = FakeBridge(bid=close, ask=close, balance=10_000.0)
+    # Opened by hand, 5% of the balance at risk to its stop
+    bridge.external.append({"label": "manual_1", "state": "FILLED", "side": "long", "qty": 100.0,
+                            "open_price": 100.0, "stop": 95.0})
+    set_cursor(cloud, bars["ts"].iloc[last - 1])
+    settings = replace(NO_LIMITS, max_open_risk=0.05)
+    result = step(settings, backtest, market, cloud, broker=bridge, now=after(bars, last))
+    assert result["external_positions"] == 1 and result["ordered"] == 0
+    [row] = store.read(cloud, "trading", "signals").itertuples()
+    assert row.reason.startswith("max open risk")
+    [ev] = store.read(cloud, "trading", "events", "kind = 'unknown_position'").itertuples()
+    assert ev.ref == "manual_1" and "stop 95" in ev.message
+
+
+def test_per_symbol_risk_cap_counts_same_direction_only():
+    settings = TradingSettings(max_open_positions=None, max_open_risk=None, max_symbol_risk=0.01)
+    ok = dict(kill_switch=False, busy=False, stale=False, balance=10_000.0, open_count=1, open_risk=100.0,
+              new_risk=100.0)
+    assert risk.check(settings, **ok, symbol_risk=0.0) is None
+    assert risk.check(settings, **ok, symbol_risk=100.0) == "max risk on the symbol (2.0% of balance)"

@@ -4,5 +4,6 @@ import dlh_tasks
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
-with DAG(dag_id="dukascopy_setup", schedule=None, catchup=False, tags=["dukascopy"]) as dag:
+with DAG(dag_id="dukascopy_setup", schedule=None, catchup=False,
+         default_args={"on_failure_callback": dlh_tasks.on_failure}, tags=["dukascopy"]) as dag:
     PythonOperator(task_id="setup", python_callable=dlh_tasks.setup)

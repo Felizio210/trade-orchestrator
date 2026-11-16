@@ -2,7 +2,8 @@
 
 For each (strategy, timeframe, symbol), the newest done run whose run_id starts with
 TRADING_RUN_PREFIX ("daily-") is checked against the TRADING_MIN_* / TRADING_MAX_*
-thresholds. A pass is stored as approved together with that run's exact parameters, so
+thresholds, on its out-of-sample (walk-forward) metrics when it has them, else on the full run;
+its last BACKTEST_RECENT_DAYS must also return at least TRADING_MIN_RECENT_RETURN. A pass is stored as approved together with that run's exact parameters, so
 trading never uses parameters that weren't backtested. A newest run older than
 TRADING_APPROVAL_MAX_AGE_DAYS is rejected: the strategy is no longer being backtested. Every failed check is written to
 `reasons`. A strategy that was approved and now fails is revoked: it opens no new
@@ -65,6 +66,9 @@ def check(m: dict, settings: TradingSettings) -> list[str]:
     at_least("avg_r", settings.min_avg_r, m.get("avg_r"))
     at_least("win_rate", settings.min_win_rate, m.get("win_rate"), "{:.1%}")
     at_least("total_return", settings.min_return, m.get("total_return"), "{:.1%}")
+    at_least("recent_return", settings.min_recent_return, m.get("recent_return"), "{:.1%}")
+    if settings.require_out_of_sample and m.get("metrics_window") != "oos":
+        reasons.append("not a walk-forward (out-of-sample) backtest")
     if settings.max_drawdown is not None:
         dd = m.get("max_drawdown")
         if _missing(dd):
@@ -82,7 +86,7 @@ def latest_metrics(settings: TradingSettings, backtest: BacktestSettings, cloud:
         return pd.DataFrame()
     runs, metrics = bt_table(backtest.dataset, "runs"), bt_table(backtest.dataset, "metrics")
     df = cloud.bq.query(
-        f"SELECT r.run_id, r.strategy, r.timeframe, r.params_json, r.created_at, m.symbol, "
+        f"SELECT r.run_id, r.strategy, r.timeframe, r.params_json, r.created_at, m.symbol, m.scope, "
         f"{', '.join('m.' + c for c in METRICS)} FROM `{runs}` r JOIN `{metrics}` m ON m.run_id = r.run_id "
         "WHERE r.status = 'done' AND m.symbol <> 'ALL' AND r.run_id LIKE @prefix",
         {"prefix": settings.run_prefix + "%"},
@@ -90,6 +94,16 @@ def latest_metrics(settings: TradingSettings, backtest: BacktestSettings, cloud:
     if df.empty:
         return df
     df["created_at"] = pd.to_datetime(df["created_at"], utc=True)
+    df["scope"] = df["scope"].fillna("full")  # runs from before windows were recorded
+    # One row per run and symbol: the standards are checked on the out-of-sample window when the
+    # run has one, else on the full run; the recent window is joined on as recent_return/_trades
+    recent = (df[df["scope"] == "recent"].set_index(["run_id", "symbol"])[["total_return", "n_trades"]]
+              .rename(columns={"total_return": "recent_return", "n_trades": "recent_trades"}))
+    main = df[df["scope"] != "recent"].copy()
+    main["rank"] = (main["scope"] == "oos").astype(int)
+    main = (main.sort_values("rank").drop_duplicates(["run_id", "symbol"], keep="last")
+            .drop(columns="rank").rename(columns={"scope": "metrics_window"}))
+    df = main.join(recent, on=["run_id", "symbol"])
     # The newest run's whole row. Not groupby().last(): that takes the last non-null value of
     # each column, so a metric the newest run left empty would be filled in from an older run.
     return (df.sort_values("created_at").drop_duplicates(["strategy", "timeframe", "symbol"], keep="last")
@@ -120,7 +134,9 @@ def evaluate(settings: TradingSettings, backtest: BacktestSettings, cloud: Cloud
         rows.append({
             "strategy": key[0], "timeframe": key[1], "symbol": key[2], "status": status, "run_id": m["run_id"],
             "params_json": m["params_json"], "reasons": "; ".join(reasons) or None,
-            **{c: m[c] for c in METRICS}, "decided_at": now,
+            **{c: m[c] for c in METRICS}, "decided_at": now, "metrics_window": m["metrics_window"],
+            "recent_return": m.get("recent_return"),
+            "recent_trades": None if m.get("recent_trades") is None else int(m["recent_trades"]),
         })
         # Only changes are logged; a rejection's reasons are already in approvals
         kind = ("approved" if status == "approved" and key not in was_approved

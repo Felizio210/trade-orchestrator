@@ -25,6 +25,15 @@ def _pipeline():
     return pipeline, Settings.from_env(), Cloud.from_env()
 
 
+def on_failure(context) -> None:
+    """on_failure_callback of every DAG: alert once a task has failed for good (see ops/alerts.py)."""
+    if str(PROJECT_DIR) not in sys.path:
+        sys.path.insert(0, str(PROJECT_DIR))
+    from ops.alerts import airflow_failure
+
+    airflow_failure(context)
+
+
 def _ticks(settings):
     """The scheduled DAGs always build from tick files, whatever DUKASCOPY_BAR_SOURCE says:
     candle files only exist per day, and the hourly runs have already cached the tick hours,
@@ -74,7 +83,7 @@ def finalize(data_interval_end, **_) -> dict:
     client = DukascopyClient(settings)
     published, existing, incomplete = [], 0, []
     for symbol in (s.upper() for s in settings.symbols):
-        if all(cloud.storage.exists(pipeline.lake_uri(settings, d, symbol, day)) for d in datasets):
+        if pipeline.in_lake(settings, cloud, symbol, day, datasets):
             existing += 1
             continue
         manifest = download_day(symbol, day, settings, client=client)
@@ -103,7 +112,12 @@ def load(**_) -> dict:
     result = pipeline.load_pending(settings, cloud)
     if result["failed"]:
         raise RuntimeError(f"{len(result['failed'])} messages failed to load: {result['failed'][:3]}")
-    return {"loaded": len(result["loaded"])}
+    if result["quality_failed"]:
+        raise RuntimeError("loaded, but quality checks failed: " + "; ".join(
+            f"{q['symbol']} {q['date']} {q['timeframe']} {q['rule']}: {q['detail']}" for q in result["quality_failed"]))
+    return {"loaded": len(result["loaded"]),
+            "quality_warnings": [f"{q['symbol']} {q['date']} {q['timeframe']} {q['rule']}: {q['detail']}"
+                                 for q in result["quality_warnings"]]}
 
 
 def repair(ds: str, **_) -> dict:
@@ -133,30 +147,20 @@ def repair(ds: str, **_) -> dict:
     problems = [f"{s['symbol']} {s['date']}: {s['summary']}" for s in result["skipped"]]
     if result["failed"]:
         problems.append(f"{len(result['failed'])} messages failed to load")
+    problems += [f"quality {q['symbol']} {q['date']} {q['timeframe']} {q['rule']}: {q['detail']}"
+                 for q in result["quality_failed"]]
     if problems:
         raise RuntimeError(f"repair incomplete, will retry: {'; '.join(problems)} ({summary})")
     return summary
 
 
 def _market_open(hour) -> bool:
-    """Rough FX/metals hours, which follow New York time: closed Friday 17:00 to Sunday 18:00,
-    and the daily 17:00 rollover hour (gold has no ticks then). In UTC that is 21:00/22:00 in
-    summer and 22:00/23:00 in winter, so the hour is converted rather than compared in UTC.
-    The sessions of Christmas, New Year's Day and Good Friday (18:00 the evening before to
-    17:00) don't trade at all. Shortened sessions around other US holidays are not modelled.
-    Only decides whether an empty hour is worth a retry."""
-    from datetime import timedelta
-    from zoneinfo import ZoneInfo
+    """Whether an empty hour is worth a retry: see ingestion/dukascopy/market_hours.py."""
+    if str(PROJECT_DIR) not in sys.path:
+        sys.path.insert(0, str(PROJECT_DIR))
+    from ingestion.dukascopy.market_hours import is_open
 
-    from dateutil.easter import easter
-
-    ny = hour.astimezone(ZoneInfo("America/New_York"))
-    weekday = ny.weekday()
-    if weekday == 5 or (weekday == 4 and ny.hour >= 17) or (weekday == 6 and ny.hour < 18) or ny.hour == 17:
-        return False
-    session = (ny + timedelta(hours=6)).date()  # a session starts at 18:00 the evening before
-    return not ((session.month, session.day) in ((12, 25), (1, 1))
-                or session == easter(session.year) - timedelta(days=2))
+    return is_open(hour)
 
 
 def freshness(data_interval_end, **_) -> dict:
@@ -227,8 +231,12 @@ def intraday(data_interval_end, **_) -> dict:
 
 # --- backtest ---
 
+# Pools (created by airflow/start.sh): with LocalExecutor tasks run in parallel, so downloads share
+# one slot (Dukascopy rate limits) and the trading step has a slot nothing else can take
+TRADING_POOL = "trading"
+DUKASCOPY_POOL = "dukascopy"
+
 MARKET_BARS = "dlh://market/bars"  # Dataset URI: dukascopy_repair emits it, backtest_daily runs on it
-HOURLY_BARS = "dlh://market/bars/hourly"  # dukascopy_hourly emits it once today's bars are loaded (trading_live runs every 5 minutes)
 BACKTEST_RESULTS = "dlh://backtest/metrics"  # backtest_daily emits it, trading_gate runs on it
 
 
@@ -273,10 +281,18 @@ def backtest(strategy: str, timeframe: str, ds: str, **_) -> dict:
     end = date.fromisoformat(ds)
     start = end - timedelta(days=int(os.environ.get("BACKTEST_DAILY_LOOKBACK_DAYS", "730")))
     result = runner.run(strategy, market.symbols, timeframe, start, end, settings, market, cloud,
-                        run_id=f"daily-{strategy}-{timeframe}-{ds}")
-    return {"run_id": result["run_id"],
-            "metrics": {m["symbol"]: {k: m[k] for k in ("n_trades", "total_return", "max_drawdown", "sharpe")}
-                        for m in result["metrics"]}}
+                        run_id=f"daily-{strategy}-{timeframe}-{ds}")  # walk-forward per BACKTEST_WALK_FORWARD
+    return {"run_id": result["run_id"], "mode": result["mode"], "params": result["params"],
+            "metrics": {f"{m['symbol']} {m['scope']}": {k: m[k] for k in ("n_trades", "total_return",
+                                                                         "max_drawdown", "sharpe")}
+                        for m in result["metrics"] + result["recent"]}}
+
+
+def backtest_prune(**_) -> dict:
+    """Thin old equity curves to one row per day (see backtest.runner.prune_equity)."""
+    runner, settings, _market, cloud = _backtest()
+    removed = runner.prune_equity(settings, cloud)
+    return {"runs_thinned": len(removed), "rows_removed": sum(removed.values())}
 
 
 # --- trading ---
@@ -294,10 +310,12 @@ def _trading():
 
 
 def trading_setup(**_) -> list[str]:
-    settings, _backtest, _market, cloud = _trading()  # puts the project on sys.path first
+    settings, backtest, _market, cloud = _trading()  # puts the project on sys.path first
+    from backtest.runner import setup as backtest_tables
     from trading.gate import setup as trading_tables
 
-    return trading_tables(settings, cloud)
+    # The gate reads backtest tables: make sure they have every column it asks for
+    return backtest_tables(backtest, cloud) + trading_tables(settings, cloud)
 
 
 def trading_gate(**_) -> dict:
@@ -309,9 +327,37 @@ def trading_gate(**_) -> dict:
             for r in evaluate(settings, backtest, cloud)}
 
 
+def trading_drift(**_) -> dict:
+    """Live trades against the backtest each strategy was approved on (trading.drift)."""
+    settings, backtest, _market, cloud = _trading()
+    from trading.drift import compare
+
+    return {f"{r['strategy']}:{r['timeframe']}:{r['symbol']}":
+            f"matched {r['matched']}/{r['backtest_trades']}, missed {r['missed_explained']}+{r['missed_unexplained']}, "
+            f"extra {r['extra']}, slippage {r['entry_slippage_r']}R" for r in compare(settings, backtest, cloud)}
+
+
 def trading_step(**_) -> dict:
     """Trade every bar that closed since the last step. Safe to retry: ids are deterministic."""
     settings, backtest, market, cloud = _trading()  # puts the project on sys.path first
     from trading.executor import step
 
     return step(settings, backtest, market, cloud)
+
+
+# --- ops ---
+
+
+def ops_summary(data_interval_end=None, **_) -> str:
+    """Send the daily health summary to every alert channel; fail if something needs attention."""
+    if str(PROJECT_DIR) not in sys.path:
+        sys.path.insert(0, str(PROJECT_DIR))
+    from ops.alerts import notify
+    from ops.health import collect
+
+    health = collect()
+    text = health.render()
+    notify(f"DLH daily: {'OK' if health.ok else f'{len(health.problems)} need attention'}", text)
+    if not health.ok:
+        raise RuntimeError("needs attention: " + "; ".join(health.problems))
+    return text

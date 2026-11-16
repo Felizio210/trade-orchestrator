@@ -27,6 +27,8 @@ RUNS_SCHEMA = [
     Field("error", "STRING"),
     Field("created_at", "TIMESTAMP", "REQUIRED"),
     Field("finished_at", "TIMESTAMP"),
+    Field("mode", "STRING"),  # fixed | walk_forward (empty on older runs = fixed)
+    Field("folds_json", "STRING"),  # walk_forward: [{"train_start", "test_start", "test_end", "params"}, ...]
 ]
 
 TRADES_SCHEMA = [
@@ -73,6 +75,10 @@ METRICS_SCHEMA = [
     Field("profit_factor", "FLOAT64"),
     Field("avg_r", "FLOAT64"),
     Field("exposure", "FLOAT64"),  # fraction of bars with a position open
+    # Which bars the row covers. full = the whole run (fixed parameters, in sample); oos = walk-forward's
+    # stitched test periods; recent = the last BACKTEST_RECENT_DAYS. Empty on older runs = full.
+    # (Not "window": that is a reserved word in BigQuery.)
+    Field("scope", "STRING"),
 ]
 
 # table -> (schema, partition field, cluster fields)

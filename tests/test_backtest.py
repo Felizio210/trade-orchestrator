@@ -1,3 +1,4 @@
+import json
 from datetime import date
 
 import numpy as np
@@ -243,7 +244,11 @@ def test_run_stores_results_and_rerun_replaces_them(env):
                                       {"r": rid})["n"][0]) for t in ("runs", "trades", "equity", "metrics")}
 
     first = counts()
-    assert first["runs"] == 1 and first["metrics"] == 3 and first["equity"] == 2 * 24 * 60
+    # per symbol + ALL (window full), and the last 90 days per symbol (window recent)
+    assert first["runs"] == 1 and first["metrics"] == 5 and first["equity"] == 2 * 24 * 60
+    windows = cloud.bq.query("SELECT scope, COUNT(*) AS n FROM backtest.metrics WHERE run_id = @r GROUP BY scope",
+                             {"r": rid}).set_index("scope")["n"].to_dict()
+    assert windows == {"full": 3, "recent": 2}
     assert first["trades"] == sum(m["n_trades"] for m in result["metrics"][:2]) > 0
     runs = cloud.bq.query("SELECT status, data_cutoff, params_json FROM backtest.runs WHERE run_id = @r", {"r": rid})
     assert runs["status"][0] == "done" and runs["data_cutoff"][0] is not None
@@ -302,3 +307,77 @@ def test_cli_run_and_list(env, monkeypatch, capsys):
     main(["list"])
     out = capsys.readouterr().out
     assert "run_id trendline-" in out and "done" in out
+
+
+# --- walk-forward, recent window, housekeeping ---
+
+def test_walk_forward_trades_only_out_of_sample_with_parameters_chosen_before(env):
+    from dataclasses import replace
+
+    from backtest.runner import walk_forward
+
+    cloud, market, settings = env
+    settings = replace(settings, wf_train_days=20, wf_test_days=10, wf_min_trades=1)
+    result = run("breakout", ["EURUSD"], "1h", date(2026, 9, 1), date(2026, 10, 30), settings, market, cloud,
+                 walk_forward_mode=True, run_id="wf")
+    row = cloud.bq.query("SELECT mode, folds_json, params_json FROM backtest.runs WHERE run_id = 'wf'").iloc[0]
+    folds = json.loads(row["folds_json"])
+    assert row["mode"] == "walk_forward" and len(folds) == 4  # 60 days: 20 train, then 4 tests of 10
+    assert [f["test_start"][:10] for f in folds] == ["2026-09-21", "2026-10-01", "2026-10-11", "2026-10-21"]
+    assert json.loads(row["params_json"]) == result["params"]
+    assert set(result["params"]) == set(strategies.get("breakout").DEFAULTS)
+    # Nothing before the first test period is simulated or stored
+    first = cloud.bq.query("SELECT MIN(ts) AS ts FROM backtest.equity WHERE run_id = 'wf'")["ts"][0]
+    assert first.startswith("2026-09-21")
+    assert result["metrics"][0]["scope"] == "oos"
+
+    # Each fold's choice only depends on bars before its test period: changing later bars
+    # can't change an earlier fold's parameters
+    bars = random_bars(n=24 * 60)
+    costs = {"EURUSD": Costs(spread=0.0001)}
+    _sig, _final, a = walk_forward("breakout", strategies.resolve_params("breakout"), {"EURUSD": bars}, costs, settings)
+    later = bars.copy()
+    later.loc[later.index >= 24 * 40, ["open", "high", "low", "close"]] *= 1.05
+    _sig, _final, b = walk_forward("breakout", strategies.resolve_params("breakout"), {"EURUSD": later}, costs, settings)
+    assert [f["params"] for f in a[:2]] == [f["params"] for f in b[:2]]
+
+
+def test_recent_metrics_start_from_the_equity_at_the_cutoff():
+    from backtest.runner import recent_metrics
+
+    ts = pd.date_range("2026-01-01", periods=200, freq="D", tz="UTC")
+    equity = pd.DataFrame({"ts": ts, "position": 0.0, "equity": [10_000.0] * 100 + [12_000.0] * 99 + [13_200.0]})
+    trades = pd.DataFrame({"entry_ts": [ts[50], ts[199]], "pnl": [2000.0, 1200.0], "r_multiple": [2.0, 1.0]})
+    m = recent_metrics(trades, equity, days=30)
+    assert m["n_trades"] == 1 and m["total_return"] == pytest.approx(0.10)
+
+
+def test_stuck_runs_are_marked_failed(env):
+    from backtest.runner import fail_stuck_runs
+
+    cloud, market, settings = env
+    now = pd.Timestamp("2026-11-16 12:00", tz="UTC")
+    for rid, age in (("old", 5), ("fresh", 1)):
+        cloud.bq.replace_from_dataframe(pd.DataFrame([{
+            "run_id": rid, "strategy": "breakout", "params_json": "{}", "symbols": "EURUSD", "timeframe": "1h",
+            "start_date": date(2026, 1, 1), "end_date": date(2026, 2, 1), "initial_capital": 1e4,
+            "risk_per_trade": 0.01, "spread_json": "{}", "commission_rate": 0.0, "status": "running",
+            "created_at": now - pd.Timedelta(hours=age)}]), "backtest.runs", {"run_id": rid})
+    assert fail_stuck_runs(settings, cloud, now=now) == ["old"]
+    status = cloud.bq.query("SELECT run_id, status FROM backtest.runs ORDER BY run_id").values.tolist()
+    assert status == [["fresh", "running"], ["old", "failed"]]
+
+
+def test_prune_keeps_the_newest_daily_curve_and_thins_the_rest(env):
+    from backtest.runner import prune_equity
+
+    cloud, market, settings = env
+    args = ("breakout", ["EURUSD"], "1h", date(2026, 9, 1), date(2026, 10, 30), settings, market, cloud)
+    for rid in ("daily-breakout-1h-a", "daily-breakout-1h-b", "adhoc"):
+        run(*args, run_id=rid)
+    later = pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=30)  # every run is now older than 7 days
+    removed = prune_equity(settings, cloud, now=later)
+    assert sorted(removed) == ["adhoc", "daily-breakout-1h-a"]
+    n = cloud.bq.query("SELECT run_id, COUNT(*) AS n FROM backtest.equity GROUP BY run_id").set_index("run_id")["n"]
+    assert n["daily-breakout-1h-b"] == 24 * 60 and n["adhoc"] == 60 == n["daily-breakout-1h-a"]
+    assert prune_equity(settings, cloud, now=later) == {}  # already thin

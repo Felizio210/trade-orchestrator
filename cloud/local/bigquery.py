@@ -93,11 +93,20 @@ class LocalBigQuery(Warehouse):
     def _dataset_file(self, dataset: str) -> Path:
         return self.dir / f"{dataset}.sqlite"
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self, datasets) -> sqlite3.Connection:
+        """An in-memory connection with the given datasets ATTACHed under their own names.
+        Only the ones needed: SQLite attaches at most 10 databases per connection."""
         conn = sqlite3.connect(":memory:", timeout=30, isolation_level=None)
-        for f in sorted(self.dir.glob("*.sqlite")):
-            conn.execute(f'ATTACH DATABASE ? AS "{f.stem}"', (str(f),))
+        names = sorted(set(datasets) & set(self.list_datasets()))
+        if len(names) > 10:
+            raise ValueError(f"One query can use at most 10 datasets locally (SQLite's limit); this one uses {names}")
+        for name in names:
+            conn.execute(f'ATTACH DATABASE ? AS "{name}"', (str(self._dataset_file(name)),))
         return conn
+
+    def _datasets_in(self, sql: str) -> set[str]:
+        """Datasets a query names (`dataset.table`), so only those get attached."""
+        return set(re.findall(r'"?([A-Za-z_][A-Za-z0-9_]*)"?\s*\.\s*[A-Za-z_"]', sql)) & set(self.list_datasets())
 
     def _schema(self, conn: sqlite3.Connection, table_id: str) -> list[Field]:
         dataset, table = split_table_id(table_id)
@@ -120,7 +129,7 @@ class LocalBigQuery(Warehouse):
         dataset, table = split_table_id(table_id)
         if dataset not in self.list_datasets():
             raise NotFound(f"Dataset {dataset!r} does not exist (run ensure_dataset first)")
-        with closing(self._connect()) as conn:
+        with closing(self._connect([dataset])) as conn:
             existing = {r[1] for r in conn.execute(f'PRAGMA "{dataset}".table_info({table})')}
             if not existing:
                 cols = ", ".join(
@@ -143,7 +152,7 @@ class LocalBigQuery(Warehouse):
 
     def replace_from_dataframe(self, df: pd.DataFrame, table_id: str, match: dict[str, Any]) -> int:
         dataset, table = split_table_id(table_id)
-        with closing(self._connect()) as conn:
+        with closing(self._connect([dataset])) as conn:
             schema = self._schema(conn, table_id)
             names = {f.name for f in schema}
             unknown = set(match) - names
@@ -177,7 +186,7 @@ class LocalBigQuery(Warehouse):
 
     def upsert_from_dataframe(self, df: pd.DataFrame, table_id: str, key: list[str]) -> int:
         dataset, table = split_table_id(table_id)
-        with closing(self._connect()) as conn:
+        with closing(self._connect([dataset])) as conn:
             schema, rows = self._keyed_rows(conn, df, table_id, key)
             cols = ", ".join(f.name for f in schema)
             marks = ", ".join("?" * len(schema))
@@ -196,7 +205,7 @@ class LocalBigQuery(Warehouse):
 
     def insert_if_absent(self, df: pd.DataFrame, table_id: str, key: list[str]) -> int:
         dataset, table = split_table_id(table_id)
-        with closing(self._connect()) as conn:
+        with closing(self._connect([dataset])) as conn:
             schema, rows = self._keyed_rows(conn, df, table_id, key)
             cols = ", ".join(f.name for f in schema)
             marks = ", ".join("?" * len(schema))
@@ -226,8 +235,9 @@ class LocalBigQuery(Warehouse):
         return self.replace_from_dataframe(df, table_id, match)
 
     def query(self, sql: str, params: dict[str, Any] | None = None) -> pd.DataFrame:
-        with closing(self._connect()) as conn:
-            return pd.read_sql_query(to_sqlite_sql(sql), conn, params={k: _param(v) for k, v in (params or {}).items()})
+        sql = to_sqlite_sql(sql)
+        with closing(self._connect(self._datasets_in(sql))) as conn:
+            return pd.read_sql_query(sql, conn, params={k: _param(v) for k, v in (params or {}).items()})
 
     def list_datasets(self) -> list[str]:
         return sorted(f.stem for f in self.dir.glob("*.sqlite")) if self.dir.is_dir() else []
@@ -235,5 +245,10 @@ class LocalBigQuery(Warehouse):
     def list_tables(self, dataset: str) -> list[str]:
         if dataset not in self.list_datasets():
             raise NotFound(f"Dataset {dataset!r} does not exist")
-        with closing(self._connect()) as conn:
+        with closing(self._connect([dataset])) as conn:
             return [r[0] for r in conn.execute(f'SELECT table_name FROM "{dataset}".{_META} ORDER BY 1')]
+
+    def compact(self, dataset: str) -> None:
+        if dataset in self.list_datasets():
+            with closing(sqlite3.connect(self._dataset_file(dataset), timeout=30, isolation_level=None)) as conn:
+                conn.execute("VACUUM")

@@ -36,6 +36,9 @@ BARS_SCHEMA = [
     Field("close", "FLOAT64", "REQUIRED"),
     Field("volume", "FLOAT64"),
     Field("ingested_at", "TIMESTAMP", "REQUIRED"),
+    # What the bars were built from: ticks | candles (Dukascopy's 1-minute candle files) | live
+    # (the broker's feed). Empty on rows loaded before it was recorded.
+    Field("source", "STRING"),
 ]
 
 PARTITION_FIELD = "date"
@@ -66,6 +69,10 @@ def schema_for(dataset: str) -> list[Field]:
 
 
 def shape(df: pd.DataFrame, dataset: str, symbol: str, day: date, ingested_at: datetime, **extra) -> pd.DataFrame:
-    """Add the identifying columns and order columns exactly as the table schema."""
+    """Add the identifying columns and order columns exactly as the table schema (optional columns
+    not given are left empty)."""
     out = df.assign(date=day, symbol=symbol, ingested_at=pd.Timestamp(ingested_at), **extra)
+    for f in schema_for(dataset):
+        if f.name not in out.columns and f.mode != "REQUIRED":
+            out[f.name] = None
     return out[[f.name for f in schema_for(dataset)]]

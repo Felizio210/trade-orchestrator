@@ -6,6 +6,8 @@
     python -m trading status             # approvals, account, open positions, kill switch
     python -m trading kill --reason "…"  # stop opening positions (open ones keep their stop/target)
     python -m trading resume             # turn the kill switch off
+    python -m trading drift              # live trades against the backtests they were approved on
+    python -m trading reconcile          # positions at the broker vs the ones this system recorded
     python -m trading broker-check       # dlh-bridge: login, account, live price (no orders)
     python -m trading broker-check --order long   # + one minimum-size order, closed again
 """
@@ -42,6 +44,8 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("gate", help="Approve or reject strategies from their latest daily backtest")
     sub.add_parser("step", help="Trade every bar that closed since the last step")
     sub.add_parser("status", help="Approvals, account, open positions and the kill switch")
+    sub.add_parser("drift", help="Live trades against the backtests they were approved on")
+    sub.add_parser("reconcile", help="Positions at the broker vs the ones this system recorded")
     p_kill = sub.add_parser("kill", help="Stop opening positions")
     p_kill.add_argument("--reason", default="turned on by hand")
     sub.add_parser("resume", help="Turn the kill switch off")
@@ -59,8 +63,43 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Cloud: {cloud.describe()}")
 
     if args.cmd == "setup":
-        for item in setup(settings, cloud):
+        from backtest.runner import setup as backtest_setup
+
+        for item in backtest_setup(backtest, cloud) + setup(settings, cloud):  # the gate reads backtest tables
             print(f"ready  {item}")
+
+    elif args.cmd == "drift":
+        from trading.drift import compare
+
+        rows = compare(settings, backtest, cloud)
+        if not rows:
+            print("(nothing traded live yet)")
+        for r in rows:
+            print(f"{r['strategy']}:{r['timeframe']}:{r['symbol']} vs {r['run_id']} "
+                  f"({r['window_start']:%Y-%m-%d}..{r['window_end']:%Y-%m-%d})\n"
+                  f"  live {r['live_trades']} backtest {r['backtest_trades']} matched {r['matched']} "
+                  f"missed {r['missed_explained']} skipped + {r['missed_unexplained']} unexplained, extra {r['extra']}\n"
+                  f"  entry slippage {_fmt(r['entry_slippage_r'])}R, avg R live {_fmt(r['live_avg_r'])} "
+                  f"backtest {_fmt(r['backtest_avg_r'])}")
+
+    elif args.cmd == "reconcile":
+        from trading import brokers
+
+        broker = brokers.get(settings, backtest, market)
+        remote = broker.open_positions()
+        if remote is None:
+            print(f"broker {broker.name} keeps no account of its own: nothing to reconcile")
+            return
+        ours = {broker.label_for(p.position_id): p for p in store.records(
+            store.read(cloud, ds, "positions", "status = 'open'"), store.Position)}
+        theirs = {p["label"]: p for p in remote}
+        for name in sorted(set(ours) | set(theirs)):
+            state = ("ok" if name in ours and name in theirs else
+                     "NOT OURS (counted in the risk limits)" if name in theirs else
+                     "recorded open, not at the broker (the next step's sync closes it)")
+            print(f"{name:<50} {state}")
+        if not ours and not theirs:
+            print("(no open positions on either side)")
 
     elif args.cmd == "gate":
         rows = evaluate(settings, backtest, cloud)

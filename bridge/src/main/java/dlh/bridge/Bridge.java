@@ -45,6 +45,8 @@ import java.util.regex.Pattern;
  * <pre>
  *   GET  /health                          connected, account id
  *   GET  /account                         balance, equity, currency
+ *   GET  /positions                       every position open on the account (FILLED orders), ours or not:
+ *                                         label, symbol, side, qty, open_price, stop
  *   GET  /tick?symbol=XAUUSD              last bid / ask
  *   GET  /bars?symbol=&period=&side=&from=   closed bars (period 1min|5min|15min|30min|1h, side bid|ask)
  *                                         opening at or after `from` (epoch ms), oldest first;
@@ -187,6 +189,17 @@ public final class Bridge implements IStrategy {
                     return new JSONObject().put("balance", a.getBalance()).put("equity", a.getEquity())
                             .put("currency", a.getAccountCurrency().getCurrencyCode())
                             .put("account_id", a.getAccountId());
+                });
+            } else if (path[0].equals("positions")) {
+                body = call(() -> {
+                    JSONArray rows = new JSONArray();
+                    for (IOrder o : context.getEngine().getOrders()) {
+                        if (o.getState() != IOrder.State.FILLED) continue;
+                        rows.put(new JSONObject().put("label", o.getLabel()).put("symbol", o.getInstrument().name())
+                                .put("side", o.isLong() ? "long" : "short").put("qty", o.getAmount() * 1e6)
+                                .put("open_price", o.getOpenPrice()).put("stop", o.getStopLossPrice()));
+                    }
+                    return new JSONObject().put("positions", rows);
                 });
             } else if (path[0].equals("tick")) {
                 Instrument instrument = instrument(param(query, "symbol"));

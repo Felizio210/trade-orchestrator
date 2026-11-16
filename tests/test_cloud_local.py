@@ -168,3 +168,18 @@ def test_gcp_query_parameter_types():
     assert query_parameter("a", date(2026, 9, 3)).type_ == "DATE"
     assert query_parameter("a", datetime(2026, 9, 3, tzinfo=timezone.utc)).type_ == "TIMESTAMP"
     assert query_parameter("a", "EURUSD").type_ == "STRING"
+
+
+def test_queries_attach_only_the_datasets_they_use(tmp_path):
+    """SQLite attaches at most 10 databases per connection; there can be more datasets than that."""
+    import pandas as pd
+
+    from cloud import Cloud, CloudSettings, Field
+
+    bq = Cloud(CloudSettings(env="local", local_dir=str(tmp_path))).bq
+    for i in range(12):
+        bq.ensure_dataset(f"d{i}")
+        bq.ensure_table(f"d{i}.t", [Field("v", "INT64")])
+        bq.replace_from_dataframe(pd.DataFrame({"v": [i]}), f"d{i}.t", {})
+    assert bq.query("SELECT a.v + b.v AS s FROM d3.t a JOIN `proj.d11.t` b ON 1 = 1")["s"].tolist() == [14]
+    assert len(bq.list_datasets()) == 12

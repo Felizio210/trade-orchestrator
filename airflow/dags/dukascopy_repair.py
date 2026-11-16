@@ -25,11 +25,11 @@ with DAG(
     start_date=pendulum.datetime(2026, 10, 30, tz="UTC"),
     catchup=False,  # each run already looks back over several days
     max_active_runs=1,
-    default_args={"retries": 2, "retry_delay": timedelta(hours=1), "execution_timeout": timedelta(hours=2)},
+    default_args={"on_failure_callback": dlh_tasks.on_failure, "retries": 2, "retry_delay": timedelta(hours=1), "execution_timeout": timedelta(hours=2)},
     tags=["dukascopy"],
 ) as dag:
     # Fails while any day in the window is still incomplete, so notify only runs on a gap-free window
-    repair = PythonOperator(task_id="repair", python_callable=dlh_tasks.repair)
+    repair = PythonOperator(task_id="repair", python_callable=dlh_tasks.repair, pool=dlh_tasks.DUKASCOPY_POOL)
     # No new bars for a Saturday, so no backtest either
     trading_day = ShortCircuitOperator(task_id="trading_day", python_callable=dlh_tasks.is_trading_day)
     # Emits the market bars Dataset, which triggers backtest_daily

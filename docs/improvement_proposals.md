@@ -5,6 +5,38 @@ I would do, and roughly how big it is (S = an hour or two, M = a day, L = severa
 Evidence comes from the code, the Airflow logs and the local warehouse; see
 `docs/pipeline_health_report.md` for the defects already fixed.
 
+## Status (16 Nov 2026)
+
+Everything except #2 (hosting) is implemented and tested (125 tests). What is not switched on by
+code, because it needs you, is marked **your step**.
+
+| # | Item | Status |
+|---|---|---|
+| 1 | Alerts | Done: `ops/alerts.py` (Telegram, webhook, email; repeats throttled), every DAG alerts on a task's final failure, `ops_daily` sends a summary at 09:45 UTC. **Your step:** fill one `ALERT_*` channel in `.env`, then `python -m ops alert-test`. |
+| 2 | Always-on host | Skipped, as asked. |
+| 3 | Broker down as a state | Done: the step checks `/health` first, skips with one `broker_down` event and alert per outage, and one `broker_up` when it returns. **Your step:** `bridge/install_launchd.sh` to run the bridge as a service that restarts itself. |
+| 4 | Out-of-sample gating | Done: walk-forward runs (`BACKTEST_WALK_FORWARD=true`, GRID per strategy, 365-day train / 90-day test), metrics `scope` full / oos / recent, gate on oos (`TRADING_REQUIRE_OUT_OF_SAMPLE=true`) plus `TRADING_MIN_RECENT_RETURN`. |
+| 5 | Live vs backtest | Done: `trading/drift.py` → `trading.drift` (matched, missed explained / unexplained, extra, entry slippage in R, R live vs backtest), run by `trading_gate`; `python -m trading drift`. 1h now uses the bridge's live bars like 5min and 15min. |
+| 6 | Holiday calendar | Done: `ingestion/dukascopy/market_hours.py`; matches every hour of the two years of bars in the warehouse. |
+| 7 | Empty-day markers | Done: a day with no data that the calendar says was closed all day gets a `_empty` marker and is never fetched again; an open day with no data is still retried. |
+| 8 | Bar source | Done: `source` column (ticks / candles), and a test that both build identical bars. |
+| 9 | Quality checks | Done: `ingestion/dukascopy/quality.py` after every bars load → `{BQ_DATASET}.quality`; structural failures fail `load`/`repair`, the rest are warnings in the summary. |
+| 10 | Equity pruning | Done: `prune` task in `backtest_daily`, `python -m backtest prune`. On a copy of your warehouse: 413 MB → 169 MB. |
+| 11 | Ten-dataset limit | Done: only the datasets a query names are attached. |
+| 12 | Broker reconciliation | Done: bridge `GET /positions`; positions not opened by this system are recorded, alerted and counted in the risk limits; `python -m trading reconcile`. **Your step:** restart the bridge so it serves `/positions` (it was rebuilt). |
+| 13 | Per-symbol risk | Done: `TRADING_MAX_SYMBOL_RISK` (same-direction risk per symbol), set to 0.01 in `.env`. |
+| 14 | Stuck runs | Done: runs still `running` after `BACKTEST_RUN_TIMEOUT_HOURS` are marked failed by the next run. |
+| 15 | Secrets | Done: `bridge/run.sh` reads the password from the macOS Keychain or GCP Secret Manager when `DUKASCOPY_DEMO_PASSWORD` is empty. **Your step:** move the password (command in `bridge/run.sh`), then empty it in `.env`. |
+| 16 | Trading step's own slot | Done: pools (`dukascopy`, `trading`), the step has top priority, and `airflow/env.sh` uses LocalExecutor once Airflow is on Postgres. **Your step:** `airflow/postgres_setup.sh` (Postgres 14 is already running here); the new database starts without the old run history. |
+| 17 | CI and pinned versions | Done: `.github/workflows/tests.yml`, `requirements.lock`. Runs once pushed to GitHub. |
+| 18 | Status view | Done: `python -m ops status` (exit code 1 when something needs attention). |
+| 19 | Cleanups | Done: the unused hourly Dataset is gone; `docs/system_overview.md` is committed; `main` is fast-forwarded to this branch (not pushed). |
+
+What turning on #4 changed, on a copy of your warehouse with today's data: `breakout:1h` stays
+approved out of sample (Sharpe 1.93 over 154 trades, +5.6% in the last 90 days), and
+`supply_demand:1h`, approved until now on its in-sample run (Sharpe 1.26), is rejected out of
+sample (Sharpe −0.08, −2.9% in the last 90 days). The whole daily batch takes about 15 seconds.
+
 My recommended order is the first five items. They are the ones that decide whether the
 system runs unattended and whether its approvals mean anything.
 

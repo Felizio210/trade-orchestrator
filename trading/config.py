@@ -50,11 +50,18 @@ class TradingSettings:
     min_avg_r: float | None = 0.1
     min_win_rate: float | None = None
     min_return: float | None = 0.0
+    # The run's last BACKTEST_RECENT_DAYS must return at least this (None = not checked), so a
+    # strategy that stopped working is revoked even while its two-year numbers still look good
+    min_recent_return: float | None = 0.0
+    # Only approve on walk-forward (out-of-sample) backtests, never on in-sample fixed-parameter runs
+    require_out_of_sample: bool = False
 
     # Risk limits on live positions. None = no limit.
     max_open_positions: float | None = 5
     max_open_risk: float | None = 0.05  # sum of risk-to-stop over open positions, fraction of balance
     max_daily_loss: float | None = 0.03  # realized loss in a UTC day, fraction of that day's opening balance
+    max_symbol_risk: float | None = None  # same-direction risk on one symbol, fraction of balance
+    drift_days: int = 30  # how far back the live-vs-backtest comparison looks
 
     @classmethod
     def from_env(cls) -> "TradingSettings":
@@ -74,9 +81,13 @@ class TradingSettings:
             min_avg_r=_float("TRADING_MIN_AVG_R", "0.1"),
             min_win_rate=_float("TRADING_MIN_WIN_RATE", ""),
             min_return=_float("TRADING_MIN_RETURN", "0"),
+            min_recent_return=_float("TRADING_MIN_RECENT_RETURN", "0"),
+            require_out_of_sample=env("TRADING_REQUIRE_OUT_OF_SAMPLE", "false").strip().lower() in ("1", "true", "yes"),
             max_open_positions=_float("TRADING_MAX_OPEN_POSITIONS", "5"),
             max_open_risk=_float("TRADING_MAX_OPEN_RISK", "0.05"),
             max_daily_loss=_float("TRADING_MAX_DAILY_LOSS", "0.03"),
+            max_symbol_risk=_float("TRADING_MAX_SYMBOL_RISK", ""),
+            drift_days=int(env("TRADING_DRIFT_DAYS", "30")),
         )
 
     def validate(self) -> None:
@@ -86,7 +97,7 @@ class TradingSettings:
             raise ValueError("TRADING_PAPER_CAPITAL must be positive.")
         if self.warmup_days < 1:
             raise ValueError("TRADING_WARMUP_DAYS must be at least 1.")
-        for name in ("max_drawdown", "max_open_risk", "max_daily_loss"):
+        for name in ("max_drawdown", "max_open_risk", "max_daily_loss", "max_symbol_risk"):
             value = getattr(self, name)
             if value is not None and not 0 < value <= 1:
                 raise ValueError(f"TRADING_{name.upper()} must be a fraction between 0 and 1, e.g. 0.15.")

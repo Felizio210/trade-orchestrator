@@ -83,6 +83,19 @@ class DukascopyBroker(Broker):
         except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
             raise BridgeError(f"bridge not reachable at {self.url} ({e}); start it with bridge/run.sh") from e
 
+    def health(self) -> str | None:
+        try:
+            health = self._call("GET", "/health")
+        except BridgeError as exc:
+            return str(exc)
+        return None if health.get("connected") else "bridge is up but not connected to Dukascopy"
+
+    def label_for(self, order_id: str) -> str:
+        return label(order_id)
+
+    def open_positions(self) -> list[dict]:
+        return self._call("GET", "/positions")["positions"]
+
     def balance(self) -> float:
         return float(self._call("GET", "/account")["balance"])
 
