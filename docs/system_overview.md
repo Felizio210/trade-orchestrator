@@ -727,7 +727,7 @@ One row per symbol, plus `ALL` when several symbols run together.
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `TRADING_DATASET` | `trading` | state dataset |
+| `TRADING_DATASET` | `trading` | state dataset prefix: `{TRADING_DATASET}_{TRADING_BROKER}`, one per broker |
 | `TRADING_BROKER` | `paper` | `paper` or `dukascopy` |
 | `TRADING_PAPER_CAPITAL` | 10000 | paper account |
 | `TRADING_WARMUP_DAYS` | 60 | bars loaded before new ones |

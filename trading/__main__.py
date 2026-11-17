@@ -60,7 +60,9 @@ def main(argv: list[str] | None = None) -> None:
     settings, backtest, market = TradingSettings.from_env(), BacktestSettings.from_env(), Settings.from_env()
     cloud = Cloud.from_env()
     ds = settings.dataset
-    print(f"Cloud: {cloud.describe()}")
+    print(f"Cloud: {cloud.describe()} (trading dataset {ds})")
+    if args.cmd != "setup" and ds not in cloud.bq.list_datasets():
+        setup(settings, cloud)  # this broker's dataset, e.g. right after switching TRADING_BROKER
 
     if args.cmd == "setup":
         from backtest.runner import setup as backtest_setup

@@ -66,9 +66,12 @@ class TradingSettings:
     @classmethod
     def from_env(cls) -> "TradingSettings":
         env = os.environ.get
+        broker = (env("TRADING_BROKER") or "paper").lower()
         return cls(
-            dataset=env("TRADING_DATASET") or "trading",
-            broker=(env("TRADING_BROKER") or "paper").lower(),
+            # One dataset per broker ({TRADING_DATASET}_{TRADING_BROKER}): paper and broker trading never
+            # share orders, positions, signals, cursors, approvals, the kill switch or the daily loss
+            dataset=f"{env('TRADING_DATASET') or 'trading'}_{broker}",
+            broker=broker,
             paper_capital=float(env("TRADING_PAPER_CAPITAL", "10000")),
             bridge_url=env("TRADING_BRIDGE_URL") or "http://127.0.0.1:8765",
             warmup_days=int(env("TRADING_WARMUP_DAYS", "60")),

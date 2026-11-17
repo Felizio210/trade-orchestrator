@@ -137,6 +137,16 @@ def step(settings: TradingSettings, backtest: BacktestSettings, market: Settings
                        "kind": kind, "ref": ref, "message": message})
         log.info("%s %s: %s", kind, ref, message)
 
+    # A broker's dataset with no decisions yet (e.g. right after switching TRADING_BROKER): create its
+    # tables and run the gate for it now, instead of trading nothing until the next trading_gate run
+    from trading.gate import evaluate, setup
+
+    if ds not in cloud.bq.list_datasets():
+        setup(settings, cloud)
+    if store.read(cloud, ds, "approvals").empty:
+        evaluate(settings, backtest, cloud, now=now)
+        log.info("no approvals in %s yet: ran the gate for it", ds)
+
     # 0. The broker: while it's down, skip the step (once-per-outage alert) instead of failing every run.
     # Positions at the broker keep their stops and targets, which the broker holds.
     controls = store.read(cloud, ds, "controls")

@@ -180,14 +180,14 @@ def test_gate_rejects_timeframes_faster_than_the_trading_schedule(env):
 
 # --- paper trading ---
 
-def approve(cloud, decided_at, params=None, symbol="EURUSD"):
-    store.write(cloud, "trading", "approvals", [{
+def approve(cloud, decided_at, params=None, symbol="EURUSD", ds="trading"):
+    store.write(cloud, ds, "approvals", [{
         "strategy": STRATEGY, "timeframe": "1h", "symbol": symbol, "status": "approved", "run_id": "daily-x",
         "params_json": json.dumps(strategies.resolve_params(STRATEGY, params)), "decided_at": decided_at}])
 
 
-def set_cursor(cloud, ts):
-    store.write(cloud, "trading", "cursors",
+def set_cursor(cloud, ts, ds="trading"):
+    store.write(cloud, ds, "cursors",
                 [{"timeframe": "1h", "symbol": "EURUSD", "last_bar_ts": ts, "updated_at": ts}])
 
 
@@ -260,6 +260,28 @@ def test_first_step_only_starts_tracking(env):
     assert cursors["last_bar_ts"].tolist() == [bars["ts"].iloc[1000]]  # newest closed bar, nothing later
 
 
+def test_each_broker_trades_in_its_own_dataset(env, monkeypatch):
+    monkeypatch.setenv("TRADING_BROKER", "paper")
+    assert TradingSettings.from_env().dataset == "trading_paper"
+    monkeypatch.setenv("TRADING_BROKER", "dukascopy")
+    monkeypatch.setenv("TRADING_DATASET", "t")
+    assert TradingSettings.from_env().dataset == "t_dukascopy"
+
+    # The first step on a broker's dataset creates it and runs the gate for it; the other one is untouched
+    cloud, market, backtest, bars = env
+    now = after(bars, len(bars) - 1)
+    write_metrics(cloud, "daily-a", now)
+    approve(cloud, now)
+    set_cursor(cloud, bars["ts"].iloc[300])
+    before = {t: store.read(cloud, "trading", t) for t in ("approvals", "cursors", "events")}
+    step(replace(NO_LIMITS, dataset="trading_other"), backtest, market, cloud, now=now)
+    [row] = store.read(cloud, "trading_other", "approvals").itertuples()
+    assert (row.status, row.run_id) == ("approved", "daily-a")
+    assert store.read(cloud, "trading_other", "cursors")["last_bar_ts"].tolist() == [bars["ts"].iloc[-1]]
+    for t, df in before.items():
+        pd.testing.assert_frame_equal(store.read(cloud, "trading", t), df)
+
+
 def test_stale_and_revoked_approvals_stop_new_orders(env):
     cloud, market, backtest, bars = env
     now = after(bars, len(bars) - 1)
@@ -285,12 +307,12 @@ def test_kill_switch_blocks_new_orders_and_resume_clears_it(env, monkeypatch, ca
     monkeypatch.setenv("DLH_ENV", "local")
     monkeypatch.setenv("LOCAL_GCP_DIR", cloud.settings.local_dir)
     now = after(bars, len(bars) - 1)
-    approve(cloud, now)
-    set_cursor(cloud, bars["ts"].iloc[300])
-    main(["kill", "--reason", "testing"])
-    result = step(NO_LIMITS, backtest, market, cloud, now=now)
+    main(["kill", "--reason", "testing"])  # creates trading_paper, the CLI's dataset (TRADING_BROKER=paper)
+    approve(cloud, now, ds="trading_paper")
+    set_cursor(cloud, bars["ts"].iloc[300], ds="trading_paper")
+    result = step(replace(NO_LIMITS, dataset="trading_paper"), backtest, market, cloud, now=now)
     assert result["ordered"] == 0 and result["skipped"] == result["signals"] > 0
-    assert set(store.read(cloud, "trading", "signals")["reason"]) == {"kill switch on"}
+    assert set(store.read(cloud, "trading_paper", "signals")["reason"]) == {"kill switch on"}
     main(["resume"])
     main(["status"])
     assert "KILL SWITCH: off" in capsys.readouterr().out

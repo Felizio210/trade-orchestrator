@@ -94,7 +94,10 @@ source airflow/env.sh                          # required before any other `airf
   (`{strategy}:{timeframe}:{symbol}:{bar_ts}`): an order is only placed if its signal row was
   actually inserted. On BigQuery that relies on one writer (`max_active_runs=1`).
 - **Datasets**: ticks in `market.dukascopy_ticks`; bars in one dataset per timeframe
-  (`market_1min.dukascopy_bars`, `market_1h.…`); backtest output in `backtest.runs/trades/equity/metrics`.
+  (`market_1min.dukascopy_bars`, `market_1h.…`); backtest output in `backtest.runs/trades/equity/metrics`;
+  trading state in one dataset per broker, `{TRADING_DATASET}_{TRADING_BROKER}` (`trading_paper`,
+  `trading_dukascopy`), so paper and broker trading never share orders, cursors, approvals or the
+  kill switch. A step on a broker's dataset that doesn't exist yet creates it and runs the gate for it.
 - **Dukascopy rate limits**: keep `DUKASCOPY_MAX_WORKERS` low; the client backs off on 429.
   Saturdays (UTC) are skipped. Incomplete days are never published to the lake; the only
   partial data is `load_intraday`, which writes today's closed bars straight to BigQuery
