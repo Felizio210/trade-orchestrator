@@ -11,6 +11,10 @@ export PATH="$P/.venv-airflow/bin:$PATH"
 export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES
 export NO_PROXY="*"
 set -a; [ -f "$P/.env" ] && . "$P/.env"; set +a
+# Relative LOCAL_GCP_DIR / LOCAL_DATA_DIR are relative to the project, wherever Airflow is started from
+# (e.g. a new Terminal window starts in ~, and every task would read and write ~/.local_gcp instead)
+case "${LOCAL_GCP_DIR:-.local_gcp}" in /*) ;; *) export LOCAL_GCP_DIR="$P/${LOCAL_GCP_DIR:-.local_gcp}" ;; esac
+case "${LOCAL_DATA_DIR:-data}" in /*) ;; *) export LOCAL_DATA_DIR="$P/${LOCAL_DATA_DIR:-data}" ;; esac
 # With a Postgres metadata database (airflow/postgres_setup.sh sets DLH_AIRFLOW_DB_URL in .env), tasks
 # run in parallel (LocalExecutor), so a long backtest or a slow download never holds up the
 # 5-minute trading step. On the default SQLite database only one task runs at a time.

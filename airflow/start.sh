@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Starts Airflow (scheduler + web UI at http://localhost:8080). Ctrl+C to stop.
 set -euo pipefail
-source "$(dirname "$0")/env.sh"
+cd "$(dirname "$0")/.."  # the project folder, whatever folder this is started from
+source airflow/env.sh
 airflow db migrate >/dev/null
 # Pools the DAGs use (see airflow/plugins/dlh_tasks.py): one slot each
 airflow pools set dukascopy 1 "Dukascopy downloads: one at a time (rate limits)" >/dev/null
